@@ -34,6 +34,14 @@ export interface ScanReport {
   filesScanned: number;
   findings: Finding[];
   counts: Record<Severity, number>;
+  /**
+   * Scan completeness warnings (P-056, mirroring hookcheck P-049): a
+   * file or directory that could not be read is named here instead of
+   * being silently skipped, in JSON and human output alike. When any
+   * warning reports an unreadable file, a CLEAN verdict is floored to
+   * REVIEW: a partial scan must not present as a complete clean one.
+   */
+  warnings: string[];
   scannedAt: string;
 }
 

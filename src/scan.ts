@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.5";
+export const VERSION = "0.1.6";
 
 export const RULES = [
   "hidden-unicode",
@@ -236,7 +236,12 @@ export function quotedSpans(line: string): QuotedSpan[] {
   while ((m = dq.exec(line)) !== null) spans.push({ start: m.index, end: m.index + m[0].length });
   const sq = /'([^'\n]{8,})'/g;
   while ((m = sq.exec(line)) !== null) {
-    if (hasAttributionFraming(line.slice(0, m.index))) spans.push({ start: m.index, end: m.index + m[0].length });
+    // P-054: framing after the quote registers the span too, not only
+    // framing before it; one of the two must be present, so ordinary
+    // apostrophes still invent no spans.
+    if (hasAttributionFraming(line.slice(0, m.index)) || hasAttributionFraming(line.slice(m.index + m[0].length))) {
+      spans.push({ start: m.index, end: m.index + m[0].length });
+    }
   }
   return spans;
 }
@@ -248,6 +253,16 @@ export interface QuoteContext { framed: boolean; spans: QuotedSpan[] }
  * attributed quotation: a quoted span with attribution framing before
  * it (or on one of the two preceding lines, the write-up lead-in
  * shape), or a blockquote line accompanied by framing.
+ *
+ * P-054: the framing may also FOLLOW the quote. Security writing
+ * quotes first and attributes after at least as often ("'Ignore
+ * previous instructions...' The preceding sentence is a payload that
+ * an attacker planted in an issue, quoted verbatim..."), so framing
+ * in the remainder of the quote's own line, or in the lines that
+ * follow it within the same paragraph (the scan stops at a blank
+ * line, and looks at most two lines ahead: the immediately following
+ * sentence), counts the same as framing before. Framing is still
+ * required: a quote followed by unrelated prose earns no downgrade.
  */
 export function framedQuotation(lines: string[], idx: number): QuoteContext {
   const line = lines[idx];
@@ -258,12 +273,20 @@ export function framedQuotation(lines: string[], idx: number): QuoteContext {
     }
     return false;
   };
+  const framingAfter = (): boolean => {
+    if (spans.length > 0 && hasAttributionFraming(line.slice(spans[spans.length - 1].end))) return true;
+    for (let j = idx + 1; j < Math.min(lines.length, idx + 3); j++) {
+      if (lines[j].trim() === "") break; // paragraph boundary
+      if (hasAttributionFraming(lines[j])) return true;
+    }
+    return false;
+  };
   if (spans.length > 0) {
-    if (hasAttributionFraming(line.slice(0, spans[0].start)) || framingNear()) {
+    if (hasAttributionFraming(line.slice(0, spans[0].start)) || framingNear() || framingAfter()) {
       return { framed: true, spans };
     }
   }
-  if (/^\s*>/.test(line) && (hasAttributionFraming(line) || framingNear())) {
+  if (/^\s*>/.test(line) && (hasAttributionFraming(line) || framingNear() || framingAfter())) {
     return { framed: true, spans };
   }
   return { framed: false, spans };
@@ -493,11 +516,26 @@ export function matchToolLure(line: string): { severity: Severity; label: string
 /* Base64 blobs                                                        */
 /* ------------------------------------------------------------------ */
 
-const BASE64_RE = /[A-Za-z0-9+/]{60,}={0,2}/g;
+/**
+ * Both base64 alphabets (P-051): the standard alphabet (+ and /) and
+ * the URL-safe alphabet (- and _), with padding present or stripped.
+ * URL-safe base64 is the alphabet of URLs, JWTs, and most
+ * machine-generated content, so it is the common case, not an exotic
+ * one. Detection accepts either alphabet and any padding state; the
+ * decoder normalizes to the standard alphabet with padding restored
+ * before decoding, which keeps the result runtime independent.
+ */
+const BASE64_RE = /[A-Za-z0-9+/\-_]{60,}={0,2}/g;
+
+export function normalizeBase64(blob: string): string {
+  const std = blob.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  const pad = (4 - (std.length % 4)) % 4;
+  return std + "=".repeat(pad);
+}
 
 function decodeBase64(blob: string): string | null {
   try {
-    const buf = Buffer.from(blob, "base64");
+    const buf = Buffer.from(normalizeBase64(blob), "base64");
     if (buf.length === 0 || buf.length > MAX_DECODED_CHARS) return null;
     const text = buf.toString("utf8");
     // Printable text check: reject binary decodes (lockfile hashes, images).
@@ -513,13 +551,31 @@ function decodeBase64(blob: string): string | null {
 /* Bounded recursive decoding (P-026)                                  */
 /* ------------------------------------------------------------------ */
 
-/** Decode numeric and common named HTML entities in a fragment. */
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+};
+
+function safeCodePoint(cp: number, raw: string): string {
+  return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : raw;
+}
+
+/**
+ * Decode numeric and common named HTML entities in a fragment.
+ * P-052: the omitted-semicolon forms are decoded too. Browsers and
+ * many parsers tolerate a numeric reference with no trailing
+ * semicolon, and the named references above without one, so an
+ * agent reading the rendered or loosely parsed text recovers the
+ * same characters. In text content (not attributes) browsers expand
+ * these legacy named references even before a letter, the classic
+ * "&notit;" rendering as a negation sign plus "it;", so the decoder
+ * does the same.
+ */
 export function decodeEntities(s: string): string {
   return s
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ");
+    .replace(/&#x([0-9a-fA-F]+);?/g, (raw, hex: string) => safeCodePoint(parseInt(hex, 16), raw))
+    .replace(/&#(\d+);?/g, (raw, dec: string) => safeCodePoint(parseInt(dec, 10), raw))
+    .replace(/&(amp|lt|gt|quot|apos|nbsp);/g, (_, name: string) => NAMED_ENTITIES[name])
+    .replace(/&(amp|lt|gt|quot|apos|nbsp)/g, (_, name: string) => NAMED_ENTITIES[name]);
 }
 
 /**
@@ -538,13 +594,21 @@ export function scanFragmentForPayload(t: string): string | null {
 }
 
 /**
+ * The finite decoding bound (P-026, raised by P-050): composed entity
+ * and base64 layers are followed to this depth and no further. A
+ * five-layer stack (the Wave C depth-5 mutant) is covered with one
+ * layer of headroom; anything deeper is a documented limit in the
+ * README, stated there as this same number.
+ */
+export const MAX_DECODE_DEPTH = 6;
+
+/**
  * All texts reachable from a fragment by bounded decoding: entity
  * decoding and base64 decoding of embedded blobs, composed recursively
- * to depth 3 (entity layer, base64 layer, entity layer covers the
- * observed stacks). Static analysis only; decoded text is scanned,
+ * to MAX_DECODE_DEPTH. Static analysis only; decoded text is scanned,
  * never executed.
  */
-export function recursiveDecodeCandidates(text: string, maxDepth = 3): string[] {
+export function recursiveDecodeCandidates(text: string, maxDepth = MAX_DECODE_DEPTH): string[] {
   const out: string[] = [];
   const seen = new Set<string>([text]);
   let frontier: Array<{ s: string; depth: number }> = [{ s: text, depth: 0 }];
@@ -555,7 +619,7 @@ export function recursiveDecodeCandidates(text: string, maxDepth = 3): string[] 
       const variants: string[] = [];
       const ent = decodeEntities(s);
       if (ent !== s) variants.push(ent);
-      const blobRe = /[A-Za-z0-9+/]{40,}={0,2}/g;
+      const blobRe = /[A-Za-z0-9+/\-_]{40,}={0,2}/g;
       let bm: RegExpExecArray | null;
       while ((bm = blobRe.exec(s)) !== null) {
         const decoded = decodeBase64(bm[0]);
@@ -664,12 +728,44 @@ export function benignCommandContext(lines: string[], idx: number): boolean {
   return true;
 }
 
+/**
+ * P-053: a sink or tool token split across a line break ("n" at the
+ * end of one line, "c host 4444" at the start of the next) must be
+ * rejoined before sink matching, the same way the flattened pass
+ * already joins lines for other constructions. The join only happens
+ * when the trailing fragment of one line and the leading token of the
+ * next combine into a known tool name, so ordinary wrapped prose is
+ * untouched. Returns the rejoined first line and the remainder of the
+ * second line, or null when no split token is present.
+ */
+const SPLITTABLE_TOOL_TOKENS = new Set(["nc", "ncat", "curl", "wget", "base64", "printenv", "cat", "bash", "sh"]);
+
+export function splitToolJoin(line: string, next: string): { first: string; second: string } | null {
+  const tail = /([A-Za-z]+)\s*$/.exec(line);
+  const head = /^([A-Za-z]+)/.exec(next.replace(/^\s+/, ""));
+  if (!tail || !head) return null;
+  const combined = (tail[1] + head[1]).toLowerCase();
+  if (!SPLITTABLE_TOOL_TOKENS.has(combined)) return null;
+  if (tail[1].toLowerCase() === combined || head[1].toLowerCase() === combined) return null;
+  const first = line.replace(/\s+$/, "") + head[1];
+  const second = next.replace(/^\s+/, "").slice(head[1].length);
+  return { first, second };
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1 };
+
 /* ------------------------------------------------------------------ */
 /* Per-text scanning                                                   */
 /* ------------------------------------------------------------------ */
 
-export function scanText(text: string, label = "<text>"): Finding[] {
+export function scanText(rawText: string, label = "<text>"): Finding[] {
   const findings: Finding[] = [];
+  // P-055: a leading byte order mark is an encoding signature, not
+  // hidden content. Strip it before scanning so it is never counted
+  // as a hidden character and never adds a spurious hidden-unicode
+  // finding to a file that merely carries one. A BOM anywhere else
+  // in the text still counts like any other zero-width character.
+  const text = rawText.replace(/^\uFEFF/, "");
   const lines = text.split(/\r?\n/);
   const isProse = PROSE_EXTENSIONS.has(extname(label).toLowerCase()) || label === "<text>" || !extname(label);
   let inFence = false;
@@ -738,7 +834,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
         lure = lure ?? matchToolLure(body);
       }
       // P-026: bounded recursive decoding of the comment body (entity
-      // layers and base64 layers composed to depth 3).
+      // layers and base64 layers composed to MAX_DECODE_DEPTH).
       let decodedHit: string | null = null;
       for (const body of variants) {
         for (const candidate of recursiveDecodeCandidates(body)) {
@@ -759,7 +855,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
       }
       if (decodedHit && !exfil && !construction) {
-        push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth 3)`);
+        push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth ${MAX_DECODE_DEPTH})`);
         if (!instr) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains encoded instruction content; comments are invisible in rendered output but read by agents");
         }
@@ -823,7 +919,12 @@ export function scanText(text: string, label = "<text>"): Finding[] {
         }
         push(lineNo, "exfil-pattern", severity, line, detail);
       }
-      const construction = matchExfilConstruction(line);
+      // P-053: a sink token split across the line break is rejoined
+      // before the construction matcher runs, so the split shape
+      // grades like the unsplit one.
+      const splitJoin = i + 1 < lines.length ? splitToolJoin(line, lines[i + 1]) : null;
+      const joinedLine = splitJoin ? splitJoin.first + splitJoin.second : null;
+      const construction = matchExfilConstruction(line) ?? (joinedLine ? matchExfilConstruction(joinedLine) : null);
       if (construction && !(exfil && exfil.severity === "high")) {
         const anchor = constructionAnchor(line);
         if (quoteCtx.framed && (wholeLineQuoted || (anchor >= 0 && inSpan(anchor)))) {
@@ -856,7 +957,15 @@ export function scanText(text: string, label = "<text>"): Finding[] {
     // tool-lure: prose files only, outside code fences and comments.
     // matchToolLure applies the negative run-report guard (P-012) first.
     if (isProse && !commented) {
-      const lure = matchToolLure(line);
+      // P-053: as for the construction above, the lure matcher also
+      // sees the line with a split sink token rejoined, and the
+      // stronger of the two grades wins.
+      const splitJoin = i + 1 < lines.length ? splitToolJoin(line, lines[i + 1]) : null;
+      let lure = matchToolLure(line);
+      if (splitJoin) {
+        const joinedLure = matchToolLure(splitJoin.first + splitJoin.second);
+        if (joinedLure && (!lure || SEVERITY_RANK[joinedLure.severity] > SEVERITY_RANK[lure.severity])) lure = joinedLure;
+      }
       if (lure) {
         // P-039: human setup prose whose command sits in the following
         // fence and is benign (install, dev server, localhost repro)
@@ -891,7 +1000,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
           let hitLabel = scanFragmentForPayload(decoded);
           let hitText = decoded;
           if (!hitLabel) {
-            for (const candidate of recursiveDecodeCandidates(decoded, 2)) {
+            for (const candidate of recursiveDecodeCandidates(decoded, MAX_DECODE_DEPTH - 1)) {
               hitLabel = scanFragmentForPayload(candidate);
               if (hitLabel) { hitText = candidate; break; }
             }
@@ -925,7 +1034,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
               let hitLabel = scanFragmentForPayload(decoded);
               let hitText = decoded;
               if (!hitLabel) {
-                for (const candidate of recursiveDecodeCandidates(decoded, 2)) {
+                for (const candidate of recursiveDecodeCandidates(decoded, MAX_DECODE_DEPTH - 1)) {
                   hitLabel = scanFragmentForPayload(candidate);
                   if (hitLabel) { hitText = candidate; break; }
                 }
@@ -942,7 +1051,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
     };
     for (let i = 0; i < lines.length; i++) {
       const t = lines[i].trim();
-      if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(t)) {
+      if (/^[A-Za-z0-9+/\-_]{20,}={0,2}$/.test(t)) {
         if (runStart < 0) runStart = i;
         runParts.push(t);
       } else {
@@ -960,6 +1069,17 @@ export function scanText(text: string, label = "<text>"): Finding[] {
    * that pass 1 missed (spanning lines, or visible only after
    * normalization) are reported here, so nothing double-counts. */
   const cleanedLines = lines.map((l) => normalizeForMatching(l));
+  // P-053: rejoin a tool token split across a line break before the
+  // flattened matchers run. The head fragment moves to the end of the
+  // earlier line and the later line keeps its remainder, so line
+  // numbering below is unchanged.
+  for (let i = 0; i + 1 < cleanedLines.length; i++) {
+    const sj = splitToolJoin(cleanedLines[i], cleanedLines[i + 1]);
+    if (sj) {
+      cleanedLines[i] = sj.first;
+      cleanedLines[i + 1] = sj.second;
+    }
+  }
   const flat = cleanedLines.join(" ");
   const offsets: number[] = [];
   {
@@ -1094,13 +1214,10 @@ const HOMOGLYPH_MAP: Record<string, string> = {
 
 export function normalizeForMatching(line: string): string {
   const stripped = line.replace(/[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu, "");
-  // Decode HTML entities (&#105;gnore) and homoglyphs (Cyrillic а) so the
-  // phrase matchers see the text a renderer or a tokenizer would show.
-  const decoded = stripped
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ");
+  // Decode HTML entities (&#105;gnore, including the omitted-semicolon
+  // forms, P-052) and homoglyphs (Cyrillic а) so the phrase matchers
+  // see the text a renderer or a tokenizer would show.
+  const decoded = decodeEntities(stripped);
   const latin = decoded.replace(/[\u0430\u0435\u043e\u0440\u0441\u0445\u0443\u0456\u0458\u04bb\u03b1\u03b5\u03bf\u03c1\u03c4\u03c7\u03c5]/g, (c) => HOMOGLYPH_MAP[c] ?? c);
   return latin.replace(/[A-Za-z0-9@$]+/g, (tok) => {
     if (!/[A-Za-z]/.test(tok) || !/[013457@$]/.test(tok)) return tok;
@@ -1112,7 +1229,7 @@ export function normalizeForMatching(line: string): string {
 /* Path scanning                                                       */
 /* ------------------------------------------------------------------ */
 
-export function collectFiles(root: string, options: ScanOptions = {}): string[] {
+export function collectFiles(root: string, options: ScanOptions = {}, warnings?: string[]): string[] {
   const maxFiles = options.maxFiles ?? 5000;
   const out: string[] = [];
   const walk = (dir: string): void => {
@@ -1120,7 +1237,14 @@ export function collectFiles(root: string, options: ScanOptions = {}): string[] 
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      // P-056: an unreadable directory is reported, never silently
+      // skipped (mirrors hookcheck P-049). Callers that pass no
+      // warnings array keep the old quiet behavior.
+      if (warnings) {
+        const code = (err as NodeJS.ErrnoException).code ?? "unreadable";
+        warnings.push(`Unreadable directory skipped: ${dir} could not be listed (${code}); the scan is partial and its files were not scanned`);
+      }
       return;
     }
     for (const entry of entries) {
@@ -1145,15 +1269,24 @@ export function computeVerdict(findings: Finding[]): Verdict {
   return "CLEAN";
 }
 
-export function makeReport(target: string, filesScanned: number, findings: Finding[]): ScanReport {
+export function makeReport(target: string, filesScanned: number, findings: Finding[], warnings: string[] = []): ScanReport {
   const counts: Record<Severity, number> = { high: 0, medium: 0, low: 0 };
   for (const f of findings) counts[f.severity]++;
+  // Partial scan floor (P-056, mirroring hookcheck P-049): when a file
+  // could not be read, the scan did not see the whole target, so a
+  // bare CLEAN is not an honest verdict. Floor at REVIEW; the warnings
+  // name exactly what was missed.
+  let verdict = computeVerdict(findings);
+  if (verdict === "CLEAN" && warnings.some((w) => w.startsWith("Unreadable"))) {
+    verdict = "REVIEW";
+  }
   return {
     target,
-    verdict: computeVerdict(findings),
+    verdict,
     filesScanned,
     findings,
     counts,
+    warnings,
     scannedAt: new Date().toISOString(),
   };
 }
@@ -1173,7 +1306,8 @@ export function scanPath(target: string, options: ScanOptions = {}): ScanReport 
   if (!stat.isDirectory()) {
     throw new Error(`Path is neither a file nor a directory: ${target}`);
   }
-  const files = collectFiles(target, options);
+  const warnings: string[] = [];
+  const files = collectFiles(target, options, warnings);
   const findings: Finding[] = [];
   let scanned = 0;
   for (const file of files) {
@@ -1184,11 +1318,16 @@ export function scanPath(target: string, options: ScanOptions = {}): ScanReport 
       if (text.includes("\0")) continue; // binary content with a text extension
       scanned++;
       findings.push(...scanText(text, file));
-    } catch {
-      // Unreadable file: skip it, never guess at its content.
+    } catch (err) {
+      // P-056: an unreadable file is skipped (never guessed at), but
+      // the skip is reported by name and reason, in JSON and human
+      // output, and the verdict floor in makeReport keeps a partial
+      // scan from presenting as an unqualified CLEAN.
+      const code = (err as NodeJS.ErrnoException).code ?? "unreadable";
+      warnings.push(`Unreadable file skipped: ${file} could not be read (${code}); the scan is partial and this file was not scanned`);
     }
   }
-  return makeReport(target, scanned, findings);
+  return makeReport(target, scanned, findings, warnings);
 }
 
 export function renderReport(report: ScanReport): string {
@@ -1202,6 +1341,9 @@ export function renderReport(report: ScanReport): string {
   for (const f of report.findings) {
     lines.push(`  [${f.severity.toUpperCase()}] ${f.file}:${f.line} ${f.rule}: ${f.detail}`);
     lines.push(`      ${f.excerpt}`);
+  }
+  for (const w of report.warnings ?? []) {
+    lines.push(`  [warn] ${w}`);
   }
   if (report.verdict === "CLEAN") {
     lines.push("CLEAN: no injection patterns matched. This does not prove the content is safe; it means none of the deterministic rules fired.");

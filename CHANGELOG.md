@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.1.6 (2026-10-22)
+
+Fix release closing the injectcheck problems from the overnight
+flywheel Wave C (mutation) and Wave E (robustness) hunts, ledger
+P-050 to P-056 in the Security Wave validation program. Every fix
+landed test-first: 22 new tests in test/wavece.test.ts, 14 of which
+failed on 0.1.5 for exactly the ledger reasons before the fix (the
+rest are controls and the spec-pinned named-entity case); 144 tests
+passing in total.
+
+- P-051: URL-safe base64 was not decoded. Base64 detection and
+  decoding now accept both alphabets (standard + and /, URL-safe
+  - and _) with padding present or stripped, in comments, on plain
+  lines, and in split-across-lines blobs. The decoder normalizes
+  the URL-safe alphabet and restores padding before decoding.
+- P-050: encoding stacks of five layers scored CLEAN. The bounded
+  recursive decoding bound is raised from depth 3 to depth 6
+  (MAX_DECODE_DEPTH in src/scan.ts, stated in the README limits),
+  so a five-layer composed entity and base64 stack is covered with
+  one layer of headroom; the bound stays finite and documented.
+- P-052: HTML entities without trailing semicolons were not
+  decoded. The entity decoder now handles the omitted-semicolon
+  forms of the numeric references and of the common named entities
+  it already handled, matching how browsers and loose parsers read
+  them in text content, and the normalization pass uses the same
+  decoder.
+- P-054 (low): attribution framing after the quote defeated the
+  P-023 documentation grading. Quoted-context detection now also
+  recognizes framing that follows the quote, in the remainder of
+  the quote's own line or within the same paragraph (at most the
+  immediately following sentences, stopping at a blank line). The
+  P-023 controls hold: a bare payload and a quote behind only a
+  neutral lead-in still verdict FINDINGS at high, as does a quote
+  followed by unrelated prose.
+- P-053 (low): a sink binary split across a line break (n plus c)
+  inside the polite lure lost both exfil findings. Lines are now
+  rejoined before sink matching when the trailing fragment of one
+  line and the leading token of the next combine into a known tool
+  name, in the per-line pass and the flattened pass; the lure
+  verdicts FINDINGS with both high findings again.
+- P-056: unreadable files in a scanned directory were silently
+  skipped. A scan now reports them explicitly: the report carries
+  a warnings list naming each skipped file and the reason, the
+  human renderer prints the warnings, and a scan with unreadable
+  files floors its verdict at REVIEW instead of presenting an
+  unqualified CLEAN (mirroring the hookcheck P-049 semantics).
+  Unreadable directories found while walking are reported the
+  same way.
+- P-055 (COSMETIC): a BOM-only file scored REVIEW on a
+  hidden-unicode low. A leading byte order mark is stripped
+  before scanning as an encoding signature and is never counted
+  as a hidden character; a BOM prefix on a payload file no
+  longer adds a spurious hidden-unicode finding.
+
+144 tests passing. Guardrails re-verified on the published binary:
+A5 FINDINGS with all rule families, A6 control REVIEW with lows
+only, wild payloads W1 to W8 all FINDINGS, the Wave B ordinary-text
+set (65 texts) at 0 FINDINGS and 0 high findings, the Wave A
+controls unchanged, and the entire accumulated corpus passing.
+
 ## 0.1.5 (2026-10-22)
 
 Fix release closing the injectcheck problems from the overnight
