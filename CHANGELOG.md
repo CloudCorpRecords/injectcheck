@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.1.10 (2026-10-22)
+
+Fix release closing six injectcheck problems from the overnight
+flywheel mutation hunt (Hunt Swarm 2: 3,569 semantics-preserving
+mutants, parser-verified): P-081, P-082, P-083, P-084, P-087, and
+P-088. One root theme: the composed normalization did not reach
+every matching pass uniformly, so semantics-preserving transforms
+hid payloads from some rules while others saw through them. Every
+fix landed test-first: 35 new tests in test/mutation.test.ts; in
+the first test-first run 18 failed on the 0.1.9 code for exactly
+the ledger reasons, and one further test (the temporal-marker
+gap the synonym sweep exposed) was added during the fix and
+also fails on the unfixed patterns; the rest are controls that
+passed before and after. 228 tests passing in total.
+
+- P-081: HTML entity encoding (hex and decimal) of payload text
+  defeated the raw-text rules in the evasion direction (REVIEW to
+  CLEAN in 40 hunt runs): the entity decoder fed the flattened
+  pass, so tool-lure and exfil-pattern, which read raw lines,
+  silently lost content the instruction pass could still see.
+- P-082: Cyrillic homoglyph (confusable) substitution dropped
+  tool-lure and exfil-pattern highs (REVIEW to CLEAN in 19 runs).
+  The confusable fold existed only in the flattened pass.
+- The fix for both: the instruction, exfil-pairing, exfil-
+  construction, and tool-lure matchers now each take the stronger
+  of their raw and composed-normalized grades (zero-width
+  stripping, entity decoding, the full Cyrillic and Greek
+  confusable tables in both cases, emphasis unwrapping, leet
+  decoding), with the raw hit winning ties and each variant
+  computing its own negation and documentation downgrades first,
+  so untransformed text grades exactly as before. The corpus
+  parity check is exact: all 39 top-level corpus files grade
+  byte-identically to 0.1.9, and the documentation-seed mutation
+  flip counts (the P-086 class, out of scope here) are unchanged.
+- P-083: badge and URL surfaces lacked composed normalization:
+  uppercasing the badge URL or entity-encoding its surface
+  defeated the percent-decode chain that detects the embedded
+  instruction payload (17 runs, all FINDINGS to CLEAN). URL
+  matching is now case-insensitive, runs on the entity-decoded
+  and surface-normalized views of the line (surface normalization
+  omits leet decoding, which would corrupt percent escapes), and
+  percent-decoding composes repeatedly with the entity, base64,
+  confusable, and entity layers in the decoded text.
+- P-084: a base64 blob rewrapped at 24 columns inside a composed
+  stack (URL-safe, padding stripped, decode instruction in a
+  comment) stopped being decoded (4 runs, all FINDINGS to CLEAN):
+  the composed-stack path extracted only contiguous tokens of 40
+  or more characters. Extraction now also joins runs of
+  whitespace-separated base64 fragments, in the recursive decoder
+  and in a document-level pass, with first-fragment and
+  last-fragment drop attempts for fragments glued to prose or a
+  comment marker.
+- P-087: wrapping a payload line in bold, italic, or a fence
+  changed its segmentation and could drop its findings entirely
+  (12 FINDINGS to CLEAN in 26 runs). Emphasis underscores glued
+  to a line's edge words are unwrapped in the matching view (an
+  underscore strictly inside a word stays, and asterisks and
+  backticks are untouched, so construction distance windows do
+  not move), and the flattened pass now dedups against actual
+  findings instead of a raw re-match, so a payload line inside a
+  fence, which the per-line pass skips by design, is no longer
+  suppressed in the document pass as well. Tool-lure still does
+  not fire inside fences; that boundary is unchanged.
+- P-088: override-verb and lure-phrase synonym swaps outside the
+  dictionary dropped instruction-phrase findings (11 FINDINGS to
+  CLEAN in 19 runs). The dictionaries now cover the natural
+  synonym class: overlook, dismiss, and set aside as override
+  verbs in the temporal, follow-on, and bare tiers; pay no
+  attention to, pay no heed to, and pay no mind to as multiword
+  override phrasings; the temporal marker above alongside
+  previous and prior in the generic override pattern (previously
+  only the ignore-specific pattern had it, which is why a swap
+  lost the w7 translation payload); disclose and divulge as
+  exfil verbs; and the contents-from shape alongside
+  contents-of. Benign uses keep their grades: the noun sets are
+  unchanged, so prose about previous versions, styling, or
+  public contents does not fire.
+
 ## 0.1.9 (2026-10-22)
 
 Fix release closing two injectcheck problems from the overnight

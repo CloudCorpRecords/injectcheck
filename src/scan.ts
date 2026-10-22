@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.9";
+export const VERSION = "0.1.10";
 
 export const RULES = [
   "hidden-unicode",
@@ -80,12 +80,19 @@ const STRONG_PHRASES: Array<{ re: RegExp; label: string }> = [
   // noun set deliberately excludes ordinary objects (versions, steps,
   // files), so "ignore previous versions and upgrade" in a changelog does
   // not fire at all.
-  { re: /\b(ignore|disregard|forget|override|bypass|overwrite|discard)\s+((?:about|all|the|your|any)\s+){0,3}(previous|preceding|prior|earlier)\s+(instructions?|directions?|prompts?|orders?|tasks?|assignments?|commands?|requests?|rules?|guidelines?|context)\b/i, label: "override of previous instructions, orders, or tasks" },
+  { re: /\b(ignore|disregard|forget|override|bypass|overwrite|discard|overlook|dismiss|set\s+aside)\s+((?:about|all|the|your|any)\s+){0,3}(previous|preceding|prior|earlier|above)\s+(instructions?|directions?|prompts?|orders?|tasks?|assignments?|commands?|requests?|rules?|guidelines?|context)\b/i, label: "override of previous instructions, orders, or tasks" },
   { re: /\bforget\s+everything\s+(before|above|prior)\b/i, label: "forget everything before" },
   // Same override family without a temporal marker, but with an
   // agent-directed follow-on (a new task or new instructions for the
   // reader): still the canonical shape, still high.
-  { re: /\b(ignore|disregard|forget|override)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b[\s\S]{0,120}?\bnew\s+(task|instructions?|assignment)\b/i, label: "override with a new task follow-on" },
+  { re: /\b(ignore|disregard|forget|override|overlook|dismiss)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b[\s\S]{0,120}?\bnew\s+(task|instructions?|assignment)\b/i, label: "override with a new task follow-on" },
+  // P-088: multiword override phrasings ("pay no attention to the
+  // previous instructions") are the same canonical shape with the verb
+  // spread over several words. The noun set is the same directive set
+  // as the single-verb patterns, so benign uses ("pay no attention to
+  // the styling") do not fire.
+  { re: /\bpay\s+no\s+(attention|heed|mind)\s+to\s+((?:about|all|the|your|any)\s+){0,3}(previous|preceding|prior|earlier|above)\s+(instructions?|directions?|prompts?|orders?|tasks?|assignments?|commands?|requests?|rules?|guidelines?|context)\b/i, label: "pay no attention to previous instructions" },
+  { re: /\bpay\s+no\s+(attention|heed|mind)\s+to\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|directions?|prompts?|orders?|tasks?|assignments?|commands?)\b[\s\S]{0,120}?\bnew\s+(task|instructions?|assignment)\b/i, label: "pay no attention to instructions, with a new task follow-on" },
 ];
 
 /** Softer instruction language aimed second-person at an AI reader. */
@@ -99,7 +106,8 @@ const SOFT_PHRASES: Array<{ re: RegExp; label: string }> = [
   // with no temporal marker and no agent-directed follow-on is medium.
   // It is worth a human look, but on its own it is also how people write
   // about their own task lists, so it never reaches high alone.
-  { re: /\b(ignore|disregard|forget|override)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b/i, label: "override of instructions, orders, or tasks (no temporal marker)" },
+  { re: /\b(ignore|disregard|forget|override|overlook|dismiss|set\s+aside)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b/i, label: "override of instructions, orders, or tasks (no temporal marker)" },
+  { re: /\bpay\s+no\s+(attention|heed|mind)\s+to\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b/i, label: "pay no attention to instructions (no temporal marker)" },
   // P-030: an imperative addressed to a named agent framework (Claude
   // Code, Cursor, Copilot, and similar) is a direct-address signal, not
   // narrative. A bare mention or an authorship disclosure does not match:
@@ -131,11 +139,7 @@ const ADDRESS_LABELS = new Set(["direct address to an AI", "imperative addressed
 
 export interface InstructionHit { severity: Severity; label: string; index: number }
 
-/**
- * Match instruction language in a text fragment, with the match offset.
- * Returns the strongest severity found, or null.
- */
-export function matchInstructionLanguageAt(text: string): InstructionHit | null {
+function matchInstructionRaw(text: string): InstructionHit | null {
   for (const { re, label } of STRONG_PHRASES) {
     const m = re.exec(text);
     if (m) return { severity: "high", label, index: m.index };
@@ -154,6 +158,30 @@ export function matchInstructionLanguageAt(text: string): InstructionHit | null 
 }
 
 /**
+ * Match instruction language in a text fragment, with the match offset.
+ * Returns the strongest severity found, or null.
+ *
+ * P-081/P-082/P-087: every matching pass sees the composed
+ * normalization (normalizeForMatching: zero-width stripping, HTML
+ * entity decoding, confusable folding, emphasis unwrapping, leet
+ * decoding), not only the flattened pass. A payload whose keywords
+ * are entity-encoded, homoglyph-substituted, or emphasis-wrapped
+ * therefore grades at the same severity as its plain form. The raw
+ * hit wins ties, so untransformed text keeps its exact current
+ * grading, labels, and offsets.
+ */
+export function matchInstructionLanguageAt(text: string): InstructionHit | null {
+  const raw = matchInstructionRaw(text);
+  if (raw && raw.severity === "high") return raw;
+  const normalized = normalizeForMatching(text);
+  if (normalized === text) return raw;
+  const folded = matchInstructionRaw(normalized);
+  if (!folded) return raw;
+  if (!raw) return folded;
+  return SEVERITY_RANK[folded.severity] > SEVERITY_RANK[raw.severity] ? folded : raw;
+}
+
+/**
  * Match instruction language in a text fragment.
  * Returns the strongest severity found, or null.
  */
@@ -166,7 +194,7 @@ export function matchInstructionLanguage(text: string): { severity: Severity; la
 /* Exfiltration patterns                                               */
 /* ------------------------------------------------------------------ */
 
-const EXFIL_VERB = /\b(send|post|upload|leak|exfiltrate|forward|transmit|email|share|submit|reveal|dump|publish)\b/i;
+const EXFIL_VERB = /\b(send|post|upload|leak|exfiltrate|forward|transmit|email|share|submit|reveal|dump|publish|disclose|divulge)\b/i;
 const EXFIL_NOUN = /(credentials?|secrets?|tokens?|api[\s_-]?keys?|private\s+keys?|passwords?|\.env\b|~\/\.ssh|id_rsa|aws[_ ]?(credentials?|access)|env(ironment)?\s+variables?|\.npmrc|\.aws\b|ssh\s+keys?|auth\s+tokens?|session\s+cookies?)/i;
 const NEGATION = /\b(never|do\s+not|don'?t|must\s+not|should\s+not|avoid|refuse\s+to|not)\s+[^.\n]{0,30}$/i;
 
@@ -455,14 +483,14 @@ export function framedQuotation(lines: string[], idx: number): QuoteContext {
   return { framed: false, spans };
 }
 
-function matchExfil(line: string): { severity: Severity; detail: string } | null {
+function matchExfilRaw(line: string): { severity: Severity; detail: string } | null {
   const verb = EXFIL_VERB.exec(line);
   const noun = EXFIL_NOUN.exec(line);
   if (!verb || !noun) return null;
   const distance = Math.abs(verb.index - noun.index);
   // Window: verb and noun within 80 chars, or the classic
   // "send the contents of X" shape anywhere on the line.
-  const contentsOf = /\b(send|post|upload|share|reveal|output|print)\s+(me\s+)?(the\s+)?(full\s+)?contents?\s+of\b/i.test(line);
+  const contentsOf = /\b(send|post|upload|share|reveal|output|print|disclose|transmit|forward)\s+(me\s+)?(the\s+)?(full\s+)?contents?\s+(of|from)\b/i.test(line);
   if (distance > 80 && !contentsOf) return null;
   // Negated safety advice ("never send your credentials") is documentation,
   // not an instruction to exfiltrate. Report at low so it stays visible.
@@ -516,6 +544,31 @@ function matchExfil(line: string): { severity: Severity; detail: string } | null
 }
 
 /**
+ * P-081/P-082/P-087: the exfil pairing sees the composed
+ * normalization like every other pass (see matchInstructionLanguageAt).
+ * Each variant grades itself first (negation and documentation
+ * downgrades are computed on the variant being matched), then the
+ * stronger grade wins; the raw hit wins ties.
+ */
+function matchExfil(line: string): { severity: Severity; detail: string } | null {
+  const raw = matchExfilRaw(line);
+  if (raw && raw.severity === "high") return raw;
+  const normalized = normalizeForMatching(line);
+  if (normalized === line) return raw;
+  const folded = matchExfilRaw(normalized);
+  if (!folded) return raw;
+  if (!raw) return folded;
+  return SEVERITY_RANK[folded.severity] > SEVERITY_RANK[raw.severity] ? folded : raw;
+}
+
+/** Verb-plus-noun exfil pairing on the raw or normalized view of a fragment. */
+function hasExfilPair(text: string): boolean {
+  if (EXFIL_VERB.test(text) && EXFIL_NOUN.test(text)) return true;
+  const normalized = normalizeForMatching(text);
+  return normalized !== text && EXFIL_VERB.test(normalized) && EXFIL_NOUN.test(normalized);
+}
+
+/**
  * Credential-read exfil construction (P-010, P-011). The classic verb and
  * noun pairing never matches the shape real write-ups use: a credential
  * file read with cat (or a full environment dump with printenv) piped to
@@ -530,7 +583,7 @@ const ENV_DUMP = /\bprintenv\b|\benv\s*\|/i;
 const ENCODE_SINK = /\|\s*(base64|xxd|gzip|od)\b/i;
 const NET_SINK = /\b(?:nc|ncat)\s+(?:-[a-z]+\s+)*[\w.\-]+\s+\d{2,5}\b|\b(?:curl|wget)\b[\s\S]{0,200}?https?:\/\//i;
 
-export function matchExfilConstruction(text: string): string | null {
+function matchExfilConstructionRaw(text: string): string | null {
   const flat = text.replace(/\s+/g, " ");
   const cred = CRED_READ.exec(flat);
   if (cred && (ENCODE_SINK.test(flat) || NET_SINK.test(flat) || /\b(curl|wget|nc|ncat)\b/i.test(flat))) {
@@ -541,6 +594,19 @@ export function matchExfilConstruction(text: string): string | null {
     return "environment dump piped to a network sink";
   }
   return null;
+}
+
+/**
+ * P-081/P-082: the construction matcher also sees the composed
+ * normalization, so an entity-encoded or homoglyph-substituted sink
+ * token (the W3 printenv-to-netcat shape with its keywords encoded)
+ * still completes the construction.
+ */
+export function matchExfilConstruction(text: string): string | null {
+  const raw = matchExfilConstructionRaw(text);
+  if (raw) return raw;
+  const normalized = normalizeForMatching(text);
+  return normalized === text ? null : matchExfilConstructionRaw(normalized);
 }
 
 /**
@@ -684,14 +750,36 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
 
-/** First tool lure matching a prose line, with its match offset, or null. */
-export function matchToolLureAt(line: string): { severity: Severity; label: string; index: number } | null {
-  if (isNegativeRunReport(line)) return null;
+function matchToolLureRaw(line: string): { severity: Severity; label: string; index: number } | null {
   for (const lure of TOOL_LURES) {
     const m = lure.re.exec(line);
     if (m) return { severity: lure.severity, label: lure.label, index: m.index };
   }
   return null;
+}
+
+/**
+ * First tool lure matching a prose line, with its match offset, or null.
+ *
+ * P-081/P-082/P-087: tool-lure was the rule family with no
+ * document-level pass behind it, so it was the family the entity,
+ * homoglyph, and emphasis mutations hit hardest (the canonical W3
+ * lure lost its high entirely when its keywords were encoded). The
+ * lure matcher now sees the composed normalization like every other
+ * pass and takes the stronger of the raw and normalized grades;
+ * the negative run-report guard (P-012) applies to both views.
+ */
+export function matchToolLureAt(line: string): { severity: Severity; label: string; index: number } | null {
+  if (isNegativeRunReport(line)) return null;
+  const raw = matchToolLureRaw(line);
+  if (raw && raw.severity === "high") return raw;
+  const normalized = normalizeForMatching(line);
+  if (normalized === line) return raw;
+  if (isNegativeRunReport(normalized)) return raw;
+  const folded = matchToolLureRaw(normalized);
+  if (!folded) return raw;
+  if (!raw) return folded;
+  return SEVERITY_RANK[folded.severity] > SEVERITY_RANK[raw.severity] ? folded : raw;
 }
 
 /** First tool lure matching a prose line, or null. Shared by the line loop and the comment pass. */
@@ -772,12 +860,20 @@ export function decodeEntities(s: string): string {
  * construction. Returns a short label for the strongest hit, or null.
  */
 export function scanFragmentForPayload(t: string): string | null {
-  const instr = matchInstructionLanguage(t);
-  if (instr) return `instruction phrase (${instr.label})`;
-  const construction = matchExfilConstruction(t);
-  if (construction) return `exfil construction (${construction})`;
-  const exfil = matchExfil(t);
-  if (exfil && exfil.severity === "high") return "exfil pattern";
+  // The matchers are normalization-aware themselves, so a decoded
+  // fragment is scanned on both its literal and its composed
+  // normalized view (P-081/P-082 for decoded surfaces, P-083 for
+  // percent-decoded URL values whose payload then needs an entity
+  // or confusable fold).
+  const views = t === normalizeForMatching(t) ? [t] : [t, normalizeForMatching(t)];
+  for (const view of views) {
+    const instr = matchInstructionLanguage(view);
+    if (instr) return `instruction phrase (${instr.label})`;
+    const construction = matchExfilConstruction(view);
+    if (construction) return `exfil construction (${construction})`;
+    const exfil = matchExfil(view);
+    if (exfil && exfil.severity === "high") return "exfil pattern";
+  }
   return null;
 }
 
@@ -789,6 +885,73 @@ export function scanFragmentForPayload(t: string): string | null {
  * README, stated there as this same number.
  */
 export const MAX_DECODE_DEPTH = 6;
+
+/**
+ * P-084: a base64 blob rewrapped at a narrow column width (24
+ * characters) inside a composed stack stops being a single token:
+ * each line is a short fragment, the first fragment shares its line
+ * with prose or a comment opener, and the composed-stack decoder,
+ * which extracted only contiguous tokens of 40 or more characters,
+ * never saw the blob. Extraction therefore also joins runs of
+ * whitespace-separated base64 fragments (each fragment 12 or more
+ * characters, the run 40 or more joined) and decodes the joined
+ * form. Because a run can start or end one fragment early or late
+ * (a fragment glued to prose, a trailing fragment carrying a
+ * comment closer), the first-fragment-dropped and
+ * last-fragment-dropped joins are tried as well; a join counts only
+ * when its decode is printable text, the same bar as single blobs.
+ */
+export interface JoinedBlob { joined: string; index: number }
+
+export function joinedBlobRuns(s: string): JoinedBlob[] {
+  const tokenRe = /\S+/g;
+  interface Tok { core: string; index: number }
+  const toks: Tok[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(s)) !== null) {
+    const raw = m[0];
+    const core = raw.replace(/^[^A-Za-z0-9+/\-_]+/, "").replace(/[^A-Za-z0-9+/\-_=]+$/, "");
+    if (core.length >= 12 && /^[A-Za-z0-9+/\-_]+={0,2}$/.test(core) && core.length >= raw.length - 6) {
+      toks.push({ core: core.replace(/=+$/, ""), index: m.index + raw.indexOf(core) });
+    } else {
+      toks.push({ core: "", index: m.index });
+    }
+  }
+  const out: JoinedBlob[] = [];
+  let run: Tok[] = [];
+  const flush = () => {
+    if (run.length >= 2) {
+      const total = run.reduce((n, t) => n + t.core.length, 0);
+      if (total >= 40) {
+        const attempts: Array<{ parts: Tok[] }> = [{ parts: run }];
+        if (run.length >= 3) {
+          attempts.push({ parts: run.slice(1) }, { parts: run.slice(0, -1) }, { parts: run.slice(1, -1) });
+        }
+        for (const { parts } of attempts) {
+          const joined = parts.map((t) => t.core).join("");
+          if (joined.length >= 40) out.push({ joined, index: parts[0].index });
+        }
+      }
+    }
+    run = [];
+  };
+  for (const t of toks) {
+    if (t.core) run.push(t);
+    else flush();
+  }
+  flush();
+  return out;
+}
+
+/** Decoded texts of every joined base64 run in a fragment. */
+export function joinedBlobDecodes(s: string): string[] {
+  const out: string[] = [];
+  for (const { joined } of joinedBlobRuns(s)) {
+    const decoded = decodeBase64(joined);
+    if (decoded && !out.includes(decoded)) out.push(decoded);
+  }
+  return out;
+}
 
 /**
  * All texts reachable from a fragment by bounded decoding: entity
@@ -813,6 +976,9 @@ export function recursiveDecodeCandidates(text: string, maxDepth = MAX_DECODE_DE
         const decoded = decodeBase64(bm[0]);
         if (decoded) variants.push(decoded);
       }
+      // P-084: blobs rewrapped at narrow widths are not single
+      // tokens; their whitespace-joined decodes are variants too.
+      for (const decoded of joinedBlobDecodes(s)) variants.push(decoded);
       for (const v of variants) {
         if (seen.has(v)) continue;
         seen.add(v);
@@ -833,7 +999,7 @@ function matchAltText(line: string): { severity: Severity; label: string; fragme
   // Image alt text: ![alt](url)
   const img = /!\[([^\]]{4,})\]\([^)]*\)/.exec(line);
   if (img) {
-    const hit = matchInstructionLanguage(img[1]) ?? (EXFIL_VERB.test(img[1]) && EXFIL_NOUN.test(img[1]) ? { severity: "high" as Severity, label: "exfil instruction in alt text" } : null);
+    const hit = matchInstructionLanguage(img[1]) ?? (hasExfilPair(img[1]) ? { severity: "high" as Severity, label: "exfil instruction in alt text" } : null);
     if (hit) return { ...hit, fragment: img[0] };
   }
   // Link with title: [text](url "title")
@@ -851,8 +1017,11 @@ function matchAltText(line: string): { severity: Severity; label: string; fragme
  * too: percent-decode each value (and the whole query), then run the
  * payload matchers on the decoded text.
  */
-function matchUrlQuery(line: string): { label: string; fragment: string } | null {
-  const urlRe = /\]\((https?:\/\/[^)\s]+)\)|<(https?:\/\/[^>\s]+)>|\b(https?:\/\/[^\s)"'<>]+)/g;
+function matchUrlQueryOn(line: string): { label: string; fragment: string } | null {
+  // P-083: URL schemes and hosts are case-insensitive and the
+  // payload survives an uppercase rendering, so the URL match is
+  // case-insensitive too.
+  const urlRe = /\]\((https?:\/\/[^)\s]+)\)|<(https?:\/\/[^>\s]+)>|\b(https?:\/\/[^\s)"'<>]+)/gi;
   let m: RegExpExecArray | null;
   while ((m = urlRe.exec(line)) !== null) {
     const url = m[1] ?? m[2] ?? m[3];
@@ -860,16 +1029,51 @@ function matchUrlQuery(line: string): { label: string; fragment: string } | null
     const query = url.slice(url.indexOf("?") + 1);
     const pieces = [query, ...query.split("&").map((kv) => kv.includes("=") ? kv.slice(kv.indexOf("=") + 1) : kv)];
     for (const piece of pieces) {
-      let decoded: string;
-      try {
-        decoded = decodeURIComponent(piece.replace(/\+/g, " "));
-      } catch {
-        decoded = piece.replace(/%([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+      // Percent-decoding composes: a value may be encoded twice, and
+      // the decoded text may itself carry entity or base64 layers,
+      // which scanFragmentForPayload and the recursive candidates
+      // cover.
+      let decoded = piece;
+      for (let round = 0; round < 3; round++) {
+        let next: string;
+        try {
+          next = decodeURIComponent(decoded.replace(/\+/g, " "));
+        } catch {
+          next = decoded.replace(/%([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+        }
+        if (next === decoded) break;
+        decoded = next;
+        const hit = scanFragmentForPayload(decoded);
+        if (hit) return { label: hit, fragment: m[0] };
+        for (const candidate of recursiveDecodeCandidates(decoded)) {
+          const deep = scanFragmentForPayload(candidate);
+          if (deep) return { label: deep, fragment: m[0] };
+        }
       }
-      if (decoded === piece) continue;
-      const hit = scanFragmentForPayload(decoded);
-      if (hit) return { label: hit, fragment: m[0] };
     }
+  }
+  return null;
+}
+
+/**
+ * P-083: badge and URL surfaces receive the composed normalization
+ * before the percent-decode chain: the surface itself may be
+ * entity-encoded or homoglyph-rendered (the URL's letters encoded
+ * as HTML entities defeat a raw URL regex entirely), and the
+ * payload case may differ from the original. The matcher therefore
+ * runs on the raw line, its entity decoding, and its full composed
+ * normalization, in that order, so untransformed lines grade
+ * exactly as before.
+ */
+function matchUrlQuery(line: string): { label: string; fragment: string } | null {
+  const views = [line];
+  const ent = decodeEntities(line);
+  if (ent !== line) views.push(ent);
+  const normalized = normalizeSurfaceForMatching(line);
+  if (normalized !== line && normalized !== ent) views.push(normalized);
+  for (const view of views) {
+    const hit = matchUrlQueryOn(view);
+    if (hit) return { label: hit.label, fragment: hit.fragment };
   }
   return null;
 }
@@ -1019,7 +1223,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         const rawExfil = matchExfil(body);
         if (!exfil && rawExfil && rawExfil.severity !== "low") exfil = rawExfil;
         construction = construction ?? matchExfilConstruction(body);
-        lure = lure ?? matchToolLure(body);
+        const bodyLure = matchToolLure(body);
+        if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
       }
       // P-026: bounded recursive decoding of the comment body (entity
       // layers and base64 layers composed to MAX_DECODE_DEPTH).
@@ -1271,6 +1476,33 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     flushRun();
   }
 
+  /* Joined base64 across prose boundaries (P-084): the split-run
+   * pass above only joins lines that are purely base64. A blob
+   * rewrapped at 24 columns inside a comment or a prose stack has
+   * its first fragment on a text line and its last fragment on the
+   * comment-closer line, so no purely-base64 run covers it. Token
+   * runs over the whole document (joinedBlobRuns) cover that shape;
+   * decoded runs are re-scanned recursively like single blobs. */
+  {
+    for (const { joined, index } of joinedBlobRuns(text)) {
+      const lineNo = text.slice(0, index).split("\n").length;
+      if (findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) continue;
+      const decoded = decodeBase64(joined);
+      if (!decoded) continue;
+      let hitLabel = scanFragmentForPayload(decoded);
+      let hitText = decoded;
+      if (!hitLabel) {
+        for (const candidate of recursiveDecodeCandidates(decoded, MAX_DECODE_DEPTH - 1)) {
+          hitLabel = scanFragmentForPayload(candidate);
+          if (hitLabel) { hitText = candidate; break; }
+        }
+      }
+      if (hitLabel) {
+        push(lineNo, "base64-blob", "high", joined, `Base64 blob rewrapped across lines (joined length ${joined.length} chars) decodes to instruction-like text (${hitLabel}): "${excerpt(hitText)}"`);
+      }
+    }
+  }
+
   /* Pass 2: flattened and normalized matching.
    * Attackers split phrases across lines, hide them behind leetspeak, or
    * break them with invisible characters. Normalize a copy of the whole
@@ -1317,8 +1549,15 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         const startLine = lineAt(m.index);
         const endLine = lineAt(m.index + m[0].length);
         const spans = endLine > startLine;
-        const rawHit = matchInstructionLanguage(lines[startLine - 1]);
-        if (!spans && rawHit) continue; // pass 1 already reported this locus
+        // P-087: dedup against actual findings, not against a raw
+        // re-match of the line. The old check assumed pass 1 had
+        // reported any line whose text matches, but pass 1 skips
+        // lines inside code fences, so a payload line wrapped in a
+        // fence was suppressed here too and vanished entirely. A
+        // locus pass 1 really reported (a finding at this line, or
+        // a comment span the comment pass already claimed) is still
+        // skipped, so nothing double-counts.
+        if (!spans && (findings.some((f) => f.rule === "instruction-phrase" && f.line === startLine) || inComment(startLine))) continue;
         const key = `instruction-phrase:${startLine}`;
         if (seenKeys.has(key)) continue;
         seenKeys.add(key);
@@ -1354,8 +1593,10 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       const startLine = lineAt(Math.min(vm.index, noun.index));
       const endLine = lineAt(Math.max(vm.index, noun.index));
       const spans = endLine > startLine;
-      const rawHit = matchExfil(lines[startLine - 1]);
-      if (!spans && rawHit) continue;
+      // P-087: same dedup correction as the instruction pass above:
+      // skip only loci with an actual exfil finding or a claimed
+      // comment span, never a fence-skipped line.
+      if (!spans && (findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine) || inComment(startLine))) continue;
       const key = `exfil-pattern:${startLine}`;
       if (seenKeys.has(key)) continue;
       seenKeys.add(key);
@@ -1583,21 +1824,76 @@ const LEET_MAP: Record<string, string> = {
 const HOMOGLYPH_MAP: Record<string, string> = {
   "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c",
   "\u0445": "x", "\u0443": "y", "\u0456": "i", "\u0458": "j", "\u04bb": "h",
+  "\u043c": "m", "\u043a": "k", "\u043f": "n", "\u0454": "e", "\u0455": "s",
+  "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K", "\u041c": "M",
+  "\u041d": "H", "\u041e": "O", "\u0420": "P", "\u0421": "C", "\u0422": "T",
+  "\u0425": "X", "\u0405": "S", "\u0406": "I", "\u0408": "J",
   "\u03b1": "a", "\u03b5": "e", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
-  "\u03c7": "x", "\u03c5": "u",
+  "\u03c7": "x", "\u03c5": "u", "\u03ba": "k", "\u03bd": "v", "\u03c9": "w",
+  "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z", "\u0397": "H",
+  "\u0399": "I", "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u039f": "O",
+  "\u03a1": "P", "\u03a4": "T", "\u03a7": "X", "\u03a5": "Y",
 };
 
-export function normalizeForMatching(line: string): string {
+/**
+ * P-087: markdown emphasis glued to a payload line's edge words
+ * hides it from token matching: an underscore is a word character,
+ * so "_ignore ..." has no word boundary before the verb. Asterisks
+ * and backticks are non-word characters, so bold and code-span
+ * wrappers never hid a token and are left exactly as they are
+ * (removing them would also compress character distances that the
+ * construction windows measure, re-grading long report lines that
+ * quote several commands). Only emphasis underscores are removed
+ * from the matching view: an underscore that is not strictly
+ * inside a word (a letter or digit on both sides is identifier
+ * punctuation, not emphasis, and stays).
+ */
+export function stripEmphasisForMatching(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "_") {
+      const prev = i > 0 ? s[i - 1] : "";
+      const next = i + 1 < s.length ? s[i + 1] : "";
+      if (!/[A-Za-z0-9]/.test(prev) || !/[A-Za-z0-9]/.test(next)) continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function composeNormalized(line: string, leet: boolean): string {
   const stripped = line.replace(/[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu, "");
   // Decode HTML entities (&#105;gnore, including the omitted-semicolon
   // forms, P-052) and homoglyphs (Cyrillic а) so the phrase matchers
-  // see the text a renderer or a tokenizer would show.
+  // see the text a renderer or a tokenizer would show. P-082: the
+  // confusable fold covers the full Latin lookalike sets in
+  // Cyrillic and Greek, upper and lower case; letters with no Latin
+  // lookalike pass through untouched, so ordinary Cyrillic or Greek
+  // prose stays itself and cannot fold into Latin payload words.
   const decoded = decodeEntities(stripped);
-  const latin = decoded.replace(/[\u0430\u0435\u043e\u0440\u0441\u0445\u0443\u0456\u0458\u04bb\u03b1\u03b5\u03bf\u03c1\u03c4\u03c7\u03c5]/g, (c) => HOMOGLYPH_MAP[c] ?? c);
-  return latin.replace(/[A-Za-z0-9@$]+/g, (tok) => {
+  const latin = decoded.replace(/[^\u0000-\u007f]/g, (c) => HOMOGLYPH_MAP[c] ?? c);
+  const unwrapped = stripEmphasisForMatching(latin);
+  if (!leet) return unwrapped;
+  return unwrapped.replace(/[A-Za-z0-9@$]+/g, (tok) => {
     if (!/[A-Za-z]/.test(tok) || !/[013457@$]/.test(tok)) return tok;
     return tok.replace(/[013457@$]/g, (c) => LEET_MAP[c] ?? c);
   });
+}
+
+export function normalizeForMatching(line: string): string {
+  return composeNormalized(line, true);
+}
+
+/**
+ * The composed normalization for encoded surfaces (URLs, badge
+ * query strings): everything normalizeForMatching does except leet
+ * decoding, because leet decoding rewrites digits inside tokens
+ * and would corrupt percent escapes (%20 would become %2o) and
+ * base64 alphabets before those decoders can run.
+ */
+export function normalizeSurfaceForMatching(line: string): string {
+  return composeNormalized(line, false);
 }
 
 /* ------------------------------------------------------------------ */
