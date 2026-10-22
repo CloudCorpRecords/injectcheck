@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 
 export const RULES = [
   "hidden-unicode",
@@ -73,6 +73,19 @@ const STRONG_PHRASES: Array<{ re: RegExp; label: string }> = [
   { re: /\b(system|developer)\s+(prompt|message)\s*:\s/i, label: "fake system/developer prompt header" },
   { re: /\bact\s+as\s+(if\s+you\s+(are|were)|a\s+different|an?\s+unrestricted)\b/i, label: "act as a different agent" },
   { re: /\bwithout\s+(telling|informing|notifying|alerting)\s+(the\s+)?(user|human|owner)\b/i, label: "act without telling the user" },
+  // Round 1 validation (P-008): the override family with the full verb and
+  // noun sets. Grading choice, documented in the README: an override verb
+  // plus a temporal marker (previous, preceding, prior, earlier) plus a
+  // directive noun is the canonical injection shape and scores high. The
+  // noun set deliberately excludes ordinary objects (versions, steps,
+  // files), so "ignore previous versions and upgrade" in a changelog does
+  // not fire at all.
+  { re: /\b(ignore|disregard|forget|override|bypass|overwrite|discard)\s+((?:about|all|the|your|any)\s+){0,3}(previous|preceding|prior|earlier)\s+(instructions?|directions?|prompts?|orders?|tasks?|assignments?|commands?|requests?|rules?|guidelines?|context)\b/i, label: "override of previous instructions, orders, or tasks" },
+  { re: /\bforget\s+everything\s+(before|above|prior)\b/i, label: "forget everything before" },
+  // Same override family without a temporal marker, but with an
+  // agent-directed follow-on (a new task or new instructions for the
+  // reader): still the canonical shape, still high.
+  { re: /\b(ignore|disregard|forget|override)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b[\s\S]{0,120}?\bnew\s+(task|instructions?|assignment)\b/i, label: "override with a new task follow-on" },
 ];
 
 /** Softer instruction language aimed second-person at an AI reader. */
@@ -82,6 +95,11 @@ const SOFT_PHRASES: Array<{ re: RegExp; label: string }> = [
   { re: /\b(ai|llm|agent|assistant|chatbot|language\s+model)\s*[:,]?\s+(please\s+)?(ignore|disregard|run|execute|send|post|upload|reveal|output|print|follow)\b/i, label: "imperative addressed to an AI" },
   { re: /\byou\s+must\s+(now\s+)?(run|execute|send|post|upload|reveal|output|print|fetch|download|install|call)\b/i, label: "you must <action>" },
   { re: /\bwhen\s+you\s+(read|see|process)\s+this\b[^.\n]{0,60}\b(run|execute|send|ignore|follow)\b/i, label: "when you read this, act" },
+  // P-008 grading, second tier: an override verb plus a directive noun
+  // with no temporal marker and no agent-directed follow-on is medium.
+  // It is worth a human look, but on its own it is also how people write
+  // about their own task lists, so it never reaches high alone.
+  { re: /\b(ignore|disregard|forget|override)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b/i, label: "override of instructions, orders, or tasks (no temporal marker)" },
 ];
 
 /**
@@ -177,6 +195,34 @@ function matchExfil(line: string): { severity: Severity; detail: string } | null
   return { severity: "low", detail: `Exfil verb "${verb[0]}" near credential noun "${noun[0]}" in narrative prose (describing an action, not instructing the reader)` };
 }
 
+/**
+ * Credential-read exfil construction (P-010, P-011). The classic verb and
+ * noun pairing never matches the shape real write-ups use: a credential
+ * file read with cat (or a full environment dump with printenv) piped to
+ * an encoder or a network sink. This matcher works on a whole fragment
+ * (a normalized HTML comment body, one line, or the flattened full text),
+ * so the construction matches across line breaks. A credential read with
+ * no encoder and no sink does not fire: reading a key file is also what
+ * legitimate setup docs describe.
+ */
+const CRED_READ = /\bcat\b[\s\S]{0,160}?(~\/\.ssh\/[\w.\-]+|id_rsa\b|\.aws\/credentials\b|\.aws\/[\w.\-]+|\.env\b|\.npmrc\b)/i;
+const ENV_DUMP = /\bprintenv\b|\benv\s*\|/i;
+const ENCODE_SINK = /\|\s*(base64|xxd|gzip|od)\b/i;
+const NET_SINK = /\b(?:nc|ncat)\s+(?:-[a-z]+\s+)*[\w.\-]+\s+\d{2,5}\b|\b(?:curl|wget)\b[\s\S]{0,200}?https?:\/\//i;
+
+export function matchExfilConstruction(text: string): string | null {
+  const flat = text.replace(/\s+/g, " ");
+  const cred = CRED_READ.exec(flat);
+  if (cred && (ENCODE_SINK.test(flat) || NET_SINK.test(flat) || /\b(curl|wget|nc|ncat)\b/i.test(flat))) {
+    return "credential file read combined with an encoder or a network tool";
+  }
+  const dump = ENV_DUMP.exec(flat);
+  if (dump && NET_SINK.test(flat)) {
+    return "environment dump piped to a network sink";
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ */
 /* Hidden unicode                                                      */
 /* ------------------------------------------------------------------ */
@@ -208,18 +254,51 @@ function matchHiddenUnicode(line: string): UnicodeHit | null {
 /* Tool lures (prose files, outside code fences)                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Negative run-report guard (P-012): CI test summaries in PR bodies list
+ * what was NOT run ("Not run: the full backend suite. CI runs them.",
+ * "Did not run the e2e suite", "No tests run"). Those lines report the
+ * absence of an action; they are never tool lures, whatever command-like
+ * shape follows the colon.
+ */
+const NEGATIVE_RUN_REPORT = /\b(not\s+run|did\s+not\s+run|didn'?t\s+run|no\s+tests?\s+(were\s+)?run|not\s+rendered|not\s+executed|was\s+not\s+run|were\s+not\s+run|not\s+yet\s+run)\b/i;
+
+export function isNegativeRunReport(line: string): boolean {
+  return NEGATIVE_RUN_REPORT.test(line);
+}
+
 const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   // A real lure names a URL to fetch. The bare shorthand "curl|sh" in docs
   // that describe the pattern has no URL and must not fire.
   { re: /\bcurl\b[^|\n]{0,200}?https?:\/\/[^\s|]+[^|\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, severity: "high", label: "curl piped to a shell" },
   { re: /\bwget\b[^|\n]{0,200}?https?:\/\/[^\s|]+[^|\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, severity: "high", label: "wget piped to a shell" },
+  // P-011: an environment dump piped through to a network sink, the polite
+  // PR prose shape. Command-shaped content presented as an instruction in
+  // prose, with or without backticks and with or without code fences on
+  // neighbouring lines. A bare printenv with no sink and no credential
+  // filter (the ordinary debugging instruction) does not fire.
+  { re: /\b(printenv|env)\b[^|\n]{0,100}?\|[^|\n]{0,120}?\|\s*(nc|ncat|curl|wget)\b/i, severity: "high", label: "environment dump piped to a network sink" },
+  { re: /\b(printenv|env)\b[^|\n]{0,100}?\|\s*(nc|ncat)\s+[\w.\-]+\s+\d{2,5}\b/i, severity: "high", label: "environment dump piped to a network sink" },
+  { re: /\bprintenv\b[^|\n]{0,100}?\|\s*grep\b[^|\n]{0,60}?(key|token|secret|pass)/i, severity: "medium", label: "environment dump filtered for credential words" },
   { re: /\b(run|execute)\s+(this|the\s+following|that)\s+(shell\s+)?(command|script)\b/i, severity: "medium", label: "instruction to run a command" },
   // "execute: true" is a config flag in MCP tool docs, not a command. The
-  // value after the colon must not be a bare boolean literal.
-  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
+  // value after the colon must not be a bare boolean literal, and a report
+  // phrase like "run: the full backend suite" (P-012) is not a command
+  // either, so a leading "the" is rejected too. Negative run reports are
+  // filtered before this list is consulted at all.
+  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b|the\b)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
   { re: /\b(install|add)\s+this\s+(package|dependency|module)\s+and\s+(run|execute)\b/i, severity: "medium", label: "install a package and run it" },
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
+
+/** First tool lure matching a prose line, or null. Shared by the line loop and the comment pass. */
+export function matchToolLure(line: string): { severity: Severity; label: string } | null {
+  if (isNegativeRunReport(line)) return null;
+  for (const lure of TOOL_LURES) {
+    if (lure.re.test(line)) return lure;
+  }
+  return null;
+}
 
 /* ------------------------------------------------------------------ */
 /* Base64 blobs                                                        */
@@ -275,6 +354,45 @@ export function scanText(text: string, label = "<text>"): Finding[] {
     findings.push({ file: label, line, rule, severity, excerpt: excerpt(src), detail });
   };
 
+  /* HTML comments are scanned as a unit (P-010). A comment spanning lines
+   * is normalized first (backslash line continuations removed, whitespace
+   * collapsed) and the instruction, exfil, exfil-construction, and
+   * tool-lure matchers all run on the whole body, so a payload split
+   * across comment lines matches the same way it would on one line.
+   * Lines covered by a comment span are skipped by the per-line prose
+   * rules below: one comment yields one finding per rule family. */
+  const commentSpans: Array<{ start: number; end: number }> = [];
+  {
+    const commentRe = /<!--([\s\S]*?)-->/g;
+    let cm: RegExpExecArray | null;
+    while ((cm = commentRe.exec(text)) !== null) {
+      const start = text.slice(0, cm.index).split("\n").length;
+      const end = start + (cm[0].match(/\n/g)?.length ?? 0);
+      commentSpans.push({ start, end });
+      const body = cm[1].replace(/\\\r?\n/g, " ").replace(/\s+/g, " ").trim();
+      const instr = matchInstructionLanguage(body);
+      const rawExfil = matchExfil(body);
+      const exfil = rawExfil && rawExfil.severity !== "low" ? rawExfil : null;
+      const construction = matchExfilConstruction(body);
+      if (instr) {
+        push(start, "html-comment-instruction", "high", cm[0], `HTML comment contains instruction language (${instr.label}); comments are invisible in rendered output but read by agents`);
+      }
+      if (exfil || construction) {
+        push(start, "exfil-pattern", "high", cm[0], `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction}`);
+        if (!instr) {
+          push(start, "html-comment-instruction", "high", cm[0], "HTML comment contains an exfil pattern; comments are invisible in rendered output but read by agents");
+        }
+      } else if (!instr) {
+        const lure = matchToolLure(body);
+        if (lure) {
+          push(start, "html-comment-instruction", "high", cm[0], `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
+        }
+      }
+    }
+  }
+  const inComment = (lineNo: number): boolean =>
+    commentSpans.some((s) => lineNo >= s.start && lineNo <= s.end);
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNo = i + 1;
@@ -287,45 +405,33 @@ export function scanText(text: string, label = "<text>"): Finding[] {
       push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent`);
     }
 
-    // html-comment-instruction: single-line and multi-line comments
-    const commentRe = /<!--([\s\S]*?)-->/g;
-    let cm: RegExpExecArray | null;
-    let commentFound = false;
-    while ((cm = commentRe.exec(line)) !== null) {
-      commentFound = true;
-      const hit = matchInstructionLanguage(cm[1]);
-      const exfil = hit ? null : matchExfil(cm[1]);
-      if (hit) push(lineNo, "html-comment-instruction", "high", cm[0], `HTML comment contains instruction language (${hit.label}); comments are invisible in rendered output but read by agents`);
-      else if (exfil) push(lineNo, "html-comment-instruction", "high", cm[0], `HTML comment contains an exfil pattern: ${exfil.detail}`);
-    }
-    // Multi-line comment opener without a closer on this line: check the
-    // joined comment body once, reported at the opener line.
-    if (!commentFound && line.includes("<!--")) {
-      const start = lines.slice(i, i + 20).join("\n");
-      const end = start.indexOf("-->");
-      if (end > 0) {
-        const body = start.slice(start.indexOf("<!--") + 4, end);
-        const hit = matchInstructionLanguage(body);
-        if (hit) push(lineNo, "html-comment-instruction", "high", line, `Multi-line HTML comment contains instruction language (${hit.label})`);
-      }
-    }
-
     if (inFence) continue; // remaining rules target prose, not code samples
 
+    // Lines inside an HTML comment were already scanned as a unit above.
+    const commented = inComment(lineNo);
+
     // alt-text-instruction
-    if (isProse) {
+    if (isProse && !commented) {
       const alt = matchAltText(line);
       if (alt) push(lineNo, "alt-text-instruction", alt.severity, alt.fragment, `Instruction language in image alt text or link title (${alt.label}); alt text is read by agents, rarely by humans`);
     }
 
-    // exfil-pattern
-    const exfil = matchExfil(line);
-    if (exfil) push(lineNo, "exfil-pattern", exfil.severity, line, exfil.detail);
+    // exfil-pattern: the verb and noun pairing, plus the credential-read
+    // construction (cat of a credential file, or an environment dump,
+    // combined with an encoder or a network sink) on the same line.
+    if (!commented) {
+      const exfil = matchExfil(line);
+      if (exfil) push(lineNo, "exfil-pattern", exfil.severity, line, exfil.detail);
+      const construction = matchExfilConstruction(line);
+      if (construction && !(exfil && exfil.severity === "high")) {
+        push(lineNo, "exfil-pattern", "high", line, `Exfil construction: ${construction}`);
+      }
+    }
 
-    // instruction-phrase (skip lines already claimed by a comment finding
+    // instruction-phrase (skip lines already claimed by the comment pass
     // to keep one finding per locus per rule family)
-    const instr = matchInstructionLanguage(line);
-    if (instr && !commentFound) {
+    const instr = commented ? null : matchInstructionLanguage(line);
+    if (instr) {
       if (isQuotedDocContext(line)) {
         // Detector docs and security writeups quote these phrases to
         // describe them. Quoted-in-documentation is low, never blocking.
@@ -335,13 +441,12 @@ export function scanText(text: string, label = "<text>"): Finding[] {
       }
     }
 
-    // tool-lure: prose files only, outside code fences
-    if (isProse) {
-      for (const lure of TOOL_LURES) {
-        if (lure.re.test(line)) {
-          push(lineNo, "tool-lure", lure.severity, line, `Tool lure in prose (${lure.label}); commands belong in code, not in text an agent is told to obey`);
-          break;
-        }
+    // tool-lure: prose files only, outside code fences and comments.
+    // matchToolLure applies the negative run-report guard (P-012) first.
+    if (isProse && !commented) {
+      const lure = matchToolLure(line);
+      if (lure) {
+        push(lineNo, "tool-lure", lure.severity, line, `Tool lure in prose (${lure.label}); commands belong in code, not in text an agent is told to obey`);
       }
     }
 
@@ -445,6 +550,31 @@ export function scanText(text: string, label = "<text>"): Finding[] {
         lines[startLine - 1],
         `Exfil verb "${vm[0]}" near credential noun "${noun.text}" detected ${spans ? `split across lines ${startLine}-${endLine}` : "after normalization (leetspeak or invisible characters)"}${doc ? ", in documentation context" : ""}`,
       );
+    }
+  }
+
+  // Exfil construction across lines (P-010): a credential file read or an
+  // environment dump on one line and its encoder or network sink on
+  // another only becomes visible once the text is flattened. This covers
+  // the comment-stripped layout of the W2 payload, where no single line
+  // carries the whole construction.
+  {
+    const construction = matchExfilConstruction(flat);
+    if (construction) {
+      const anchor = flat.search(/\bcat\b|\bprintenv\b|\benv\s*\|/i);
+      const startLine = lineAt(Math.max(0, anchor));
+      const key = `exfil-pattern:${startLine}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        const doc = isDocContext(lines[startLine - 1]);
+        push(
+          startLine,
+          "exfil-pattern",
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `Exfil construction (${construction}) detected across lines ${doc ? ", in documentation context" : ""}`,
+        );
+      }
     }
   }
 

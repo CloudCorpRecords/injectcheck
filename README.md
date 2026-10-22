@@ -14,9 +14,9 @@ It never claims content is safe. The clean verdict is CLEAN, and CLEAN means onl
 | --- | --- |
 | `hidden-unicode` | Zero-width characters, bidi controls, unicode tag characters, and variation selectors in suspicious density. Invisible to a human reader, fully visible to an agent. |
 | `html-comment-instruction` | HTML comments containing instruction language aimed at an agent or LLM. Comments vanish in rendered output and survive in raw text. |
-| `instruction-phrase` | Direct instruction phrases: "ignore previous instructions", "disregard the above", "you are now", "new instructions:", plus second-person imperatives addressed to an AI. |
-| `exfil-pattern` | Send, post, upload, leak, or forward verbs combined with credential nouns (secrets, tokens, api keys, .env, ~/.ssh) inside a short window. Negated safety advice ("never send your password") is downgraded to low. |
-| `tool-lure` | Text in non-code prose files telling a reader to run a shell command, pipe curl to a shell, or install a package and run it. Fenced code blocks are exempt: commands in code are documentation, commands in prose are lures. |
+| `instruction-phrase` | Direct instruction phrases aimed at an AI: the override family ("ignore", "disregard", "forget", "override" plus previous, preceding, prior, or earlier plus instructions, orders, tasks, assignments, prompts, or context), "you are now", "new instructions:", plus second-person imperatives addressed to an AI. Grading is documented below. |
+| `exfil-pattern` | Send, post, upload, leak, or forward verbs combined with credential nouns (secrets, tokens, api keys, .env, ~/.ssh) inside a short window. Also the credential-read construction: a credential file read with cat, or a full environment dump, combined with an encoder (base64) or a network tool (curl, nc) anywhere in the same comment, line, or flattened text, so the shape matches across line breaks. Negated safety advice ("never send your password") is downgraded to low. |
+| `tool-lure` | Text in non-code prose files telling a reader to run a shell command, pipe curl to a shell, dump the environment to a network sink, or install a package and run it. Command-shaped content in prose fires with or without backticks. Fenced code blocks are exempt: commands in code are documentation, commands in prose are lures. Negative run reports are exempt too: a CI test summary line like "Not run: the full backend suite. CI runs them." reports that something did not happen and never fires this rule. |
 | `base64-blob` | Long base64 strings that decode to instruction-like text. The decoded text is re-scanned with the instruction and exfil rules; blobs that decode to binary or benign text are ignored. Decoded size is capped. |
 | `alt-text-instruction` | Instruction language inside image alt text or link titles in markdown. Alt text is read by agents and screen tooling, rarely by reviewers. |
 
@@ -25,6 +25,10 @@ Scoring and verdicts:
 - **FINDINGS**: any high severity finding, or 3 or more medium findings. Exit code 1.
 - **REVIEW**: any medium or low finding that does not reach the FINDINGS bar. Exit code 1.
 - **CLEAN**: no rule matched. Exit code 0.
+
+HTML comments are scanned as a unit: the whole comment body, across every line it spans, is normalized (line continuations removed, whitespace collapsed) before the rules run, so a payload split across comment lines matches the same way it would on one line.
+
+Instruction-phrase grading, the choice stated plainly: an override verb plus a temporal marker plus a directive noun (the canonical "ignore all preceding orders", "forget all previous tasks" shape) scores high, with or without an explicit mention of an AI, because that sentence shape has almost no legitimate use inside content written for someone else to act on. The same override without a temporal marker scores high only when the text also carries an agent-directed follow-on (a new task or new instructions for the reader); on its own it scores medium, because people also write that way about their own task lists. The noun set deliberately excludes ordinary objects, so "ignore previous versions and upgrade" in a changelog does not fire at all. Phrases quoted inside documentation that describes the patterns score low, as before.
 
 Documentation about prompt injection does not verdict FINDINGS by design. The patterns require actual instruction phrasing, exfil shapes, or hidden characters, not the mere mention of the topic, and negated safety advice is reported at low severity so it stays visible without blocking anyone. Two tuning rules keep honest docs honest: an exfil verb near a credential noun only scores high in directive shape (an imperative, a "contents of" request, a URL destination), while third-person narrative about an attack scores low; and instruction phrases quoted inside documentation that describes the patterns (detector docs, security writeups) score low instead of high. This is tested against real documents: the spec this tool was built from scans at REVIEW with only low findings, never FINDINGS.
 
@@ -96,6 +100,7 @@ Honest limits, stated plainly:
 - Fenced code blocks are exempt from the prose rules by design. An injection written as a code sample will not fire the prose rules (hidden unicode still fires everywhere).
 - Base64 payloads are only flagged when the decoded text itself matches the instruction or exfil rules. A doubly encoded or encrypted payload is out of reach for a deterministic scanner.
 - This is a pattern scanner, not a proof of safety and not a semantic judge. Paraphrased instructions with no known phrase, verb, or noun will pass. CLEAN means no pattern matched, nothing more.
+- Scope boundary: this tool scans content an agent reads (issues, PRs, docs, comments) for planted instructions. Prompts aimed directly at a chatbot in conversation, such as persona roleplay and jailbreak attempts with no agent-content framing, are a neighboring problem and are out of scope by design.
 
 ## The toolkit
 

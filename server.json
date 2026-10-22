@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "description": "Prompt-injection scan for agent-read content: hidden unicode, comment instructions, exfil patterns, tool lures, base64 payloads.",
+  "description": "Scan what AI agents read for prompt injection: hidden unicode, comment instructions, exfil, lures.",
   "name": "io.github.CloudCorpRecords/injectcheck",
   "packages": [
     {
@@ -17,10 +17,10 @@
       "transport": {
         "type": "stdio"
       },
-      "version": "0.1.1"
+      "version": "0.1.2"
     },
     {
-      "identifier": "ghcr.io/cloudcorprecords/injectcheck:0.1.1",
+      "identifier": "ghcr.io/cloudcorprecords/injectcheck:0.1.2",
       "packageArguments": [
         {
           "type": "positional",
@@ -48,5 +48,5 @@
     "source": "github",
     "url": "https://github.com/CloudCorpRecords/injectcheck"
   },
-  "version": "0.1.1"
+  "version": "0.1.2"
 }
