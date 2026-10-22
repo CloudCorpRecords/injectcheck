@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.7 (2026-10-22)
+
+Fix release closing two injectcheck problems from the overnight
+flywheel: P-066 from the Wave D self-dogfood hunt, and P-013, the
+cosmetic entry open since Round 1. Every fix landed test-first:
+17 new tests in test/waved.test.ts, 10 of which failed on 0.1.6
+for exactly the ledger reasons before the fix (the rest are
+adversarial controls and the saturation side of P-013); 161 tests
+passing in total.
+
+- P-066: the documentation-context grading recognized attribution
+  only as framing sentences, so it failed on the changelog and
+  report genres at estate scale: this changelog verdicts FINDINGS
+  with 4 high findings on 0.1.6, all of them payloads described in
+  fix notes, and 5 of the 8 overnight hunt reports verdicts
+  FINDINGS with 15 high findings among them, all hand read as
+  labeled evidence excerpts, method prose, or quoted tool output,
+  with zero true positives. Structural attribution is now
+  recognized alongside sentential framing: an evidence, output, or
+  quoted label in the same bullet or paragraph; a report segment
+  opening with a section label such as Method, Evidence,
+  Justification, or Judgment; a finding listing that quotes another
+  document's flagged line; and fix-note narration in a
+  problem-numbered bullet or under a version heading (the scanner
+  now catches, now scans, now fires, or does not fire). Payload
+  text exhibited in those contexts, in quotation marks or backtick
+  spans or as the described subject of the segment, now grades low
+  for the instruction-phrase, exfil-pattern, exfil-construction,
+  and tool-lure rules. Two latent defects fell out of the same
+  work and are fixed here: the flattened exfil construction
+  anchor reported its offset in re-collapsed coordinates, which
+  misattributed its line (and therefore its context) in documents
+  with indented continuation lines; and that pass deduplicated
+  against claimed matcher keys rather than actual findings, which
+  the corrected anchor exposed on the fence-split shape. The
+  guardrails are pinned as adversarial
+  controls: a bare payload under a fake version heading with no
+  narrating fix language, a payload after a generic Fixed word, a
+  quote behind only a neutral lead-in, and a bare payload
+  paragraph in a report-shaped document all still verdict
+  FINDINGS at high.
+- P-013 (COSMETIC): hidden-unicode severity did not scale with
+  density: exactly 2 zero-width characters in ordinary prose
+  graded medium. Severity now scales with density and clustering:
+  5 or more invisible characters on a line still grade high; a
+  character embedded inside a word (a letter or digit on both
+  sides) grades medium at any count, because splitting a word is
+  the concealment shape; sparse isolated characters at word or
+  sentence boundaries grade low. The sparse corpus shape now
+  grades low, and the dense and in-word shapes keep their grades.
+
+161 tests passing. Guardrails re-verified on the published binary:
+A5 FINDINGS with all rule families, A6 control REVIEW with lows
+only, wild payloads W1 to W8 all FINDINGS, the Wave B ordinary-text
+set (65 texts) at 0 FINDINGS and 0 high findings, the Wave A
+controls unchanged, and the entire accumulated corpus passing.
+This changelog and both required hunt reports no longer verdict
+FINDINGS; their former high findings grade low.
+
 ## 0.1.6 (2026-10-22)
 
 Fix release closing the injectcheck problems from the overnight

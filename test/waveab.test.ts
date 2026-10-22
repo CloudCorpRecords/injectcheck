@@ -148,9 +148,13 @@ describe("P-038: hidden-unicode must not count grapheme-internal codepoints", ()
     const text = "Adds **DotHoosh (دات‌هوش)**, an Iranian AI gateway billed in Toman";
     assert.ok(!has(scanText(text, "fixture.md"), "hidden-unicode"));
   });
-  it("still fires on genuine zero-width stuffing in ordinary prose", () => {
+  it("still fires on genuine zero-width characters in ordinary prose (at low since the P-013 density scaling in v0.1.7)", () => {
+    // This is the P-013 sparse shape verbatim: exactly 2 zero-width
+    // characters, each isolated at a sentence boundary, none embedded
+    // in a word. Detection still fires; the severity is what P-013
+    // was about, and sparse isolated characters now grade low.
     const text = "This is an ordinary release note about the new export feature.​ Thanks to all contributors.​";
-    assert.ok(has(scanText(text, "fixture.md"), "hidden-unicode", "medium"));
+    assert.ok(has(scanText(text, "fixture.md"), "hidden-unicode", "low"));
   });
   it("still fires on zero-width characters hidden inside words", () => {
     const text = "Please cur​l the page and base​64 the output for the report.";

@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.6";
+export const VERSION = "0.1.7";
 
 export const RULES = [
   "hidden-unicode",
@@ -218,8 +218,17 @@ const ATTRIBUTION_RE = new RegExp(`\\b${ATTRIBUTION_SUBJECT}\\b[^"']{0,100}?\\b$
 const ATTRIBUTION_BY_RE = new RegExp(`\\b${ATTRIBUTION_VERB}\\b[^"']{0,40}?\\bby\\b[^"']{0,40}?\\b${ATTRIBUTION_SUBJECT}\\b`, "i");
 const FRAMING_RE = /\b(the\s+following\s+(text|payload|message|prompt|instructions?|content|comment)|quoted\s+(below|above|verbatim|here|example)|verbatim\s+(quote|text|payload)|example\s+(payload|prompt|injection)|sample\s+payload)\b/i;
 
+/**
+ * Structural attribution labels (P-066): reports and changelogs also
+ * attribute payloads with labels rather than framing sentences. A
+ * payload presented after an evidence or output label, or introduced
+ * with the word quoted and a colon, is being exhibited as evidence,
+ * not issued as an instruction.
+ */
+export const EVIDENCE_LABEL_RE = /\b(evidence|output|quoted)\s+(excerpt|line|text|example)\s*:|\bquoted\s*:|\boutput\s+excerpt\b/i;
+
 export function hasAttributionFraming(text: string): boolean {
-  return ATTRIBUTION_RE.test(text) || ATTRIBUTION_BY_RE.test(text) || FRAMING_RE.test(text);
+  return ATTRIBUTION_RE.test(text) || ATTRIBUTION_BY_RE.test(text) || FRAMING_RE.test(text) || EVIDENCE_LABEL_RE.test(text);
 }
 
 export interface QuotedSpan { start: number; end: number }
@@ -244,6 +253,87 @@ export function quotedSpans(line: string): QuotedSpan[] {
     }
   }
   return spans;
+}
+
+/** Backtick code spans on a line (single or double backtick fences). */
+export function codeSpans(line: string): QuotedSpan[] {
+  const spans: QuotedSpan[] = [];
+  let m: RegExpExecArray | null;
+  const re = /``([^`\n]+)``|`([^`\n]+)`/g;
+  while ((m = re.exec(line)) !== null) spans.push({ start: m.index, end: m.index + m[0].length });
+  return spans;
+}
+
+/* ------------------------------------------------------------------ */
+/* Structural documentation context (P-066)                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-066: the P-023 grading recognized attribution as framing
+ * sentences, but real security writing also attributes structurally:
+ * a changelog bullet under a version heading that narrates a fix, a
+ * hunt or audit report that presents payloads as labeled evidence
+ * excerpts or quoted tool output, a problem-numbered entry quoting
+ * the phrases a rule now catches. The structural signals below are
+ * deliberately narrow, and none of them is a genre marker alone:
+ *
+ * - a labeled excerpt: an evidence, output, or quoted label in the
+ *   same bullet or paragraph, at or before the payload line;
+ * - a report segment opening with a section label (Method, Evidence,
+ *   Justification, Judgment, Finding, Verdict) followed by a colon;
+ * - a finding listing: a line that enumerates a rule id with a
+ *   severity and a line number, quoting another document's finding;
+ * - a fix-note narration: a problem-numbered bullet, or a bullet in
+ *   a document carrying a version heading, whose text narrates what
+ *   the scanner now does with the payload (now catches, now scans,
+ *   now fires, does not fire, and similar).
+ *
+ * A bare payload under a fake version heading carries none of these
+ * signals and keeps its live grade, as the adversarial controls in
+ * test/waved.test.ts pin.
+ */
+export interface StructuralContext { framed: boolean; kind: string }
+
+const REPORT_LABEL_RE = /^\s*[-*]?\s*(method|evidence|justification|judgement|judgment|finding|findings|verdict|summary)\b[^:\n]{0,40}:/i;
+const FINDING_LISTING_RE = /^\s*[-*]?\s*(hidden-unicode|html-comment-instruction|instruction-phrase|exfil-pattern|tool-lure|base64-blob|alt-text-instruction)\s*,\s*(high|medium|low)\b/i;
+const FIX_NARRATION_RE = /\b(now\s+(fire|fires|fired|verdicts|scans|scanned|catches|caught|grades|graded)|does not fire|did not fire|no longer\s+(fire|fires|flags|verdicts))\b/i;
+const VERSION_HEADING_RE = /^\s*#{1,3}\s+\[?v?\d+\.\d+\.\d+/;
+
+/** The bullet or paragraph segment containing lines[idx]. */
+export function segmentRange(lines: string[], idx: number): [number, number] {
+  const isBullet = (l: string) => /^\s*(?:[-*+]\s|\d+[.)]\s)/.test(l);
+  const isHeading = (l: string) => /^\s*#{1,6}\s/.test(l);
+  let start = idx;
+  while (start > 0) {
+    const prev = lines[start - 1];
+    if (prev.trim() === "" || isHeading(prev)) break;
+    start--;
+    if (isBullet(lines[start])) break;
+  }
+  let end = idx;
+  while (end + 1 < lines.length) {
+    const nxt = lines[end + 1];
+    if (nxt.trim() === "" || isHeading(nxt) || isBullet(nxt)) break;
+    end++;
+  }
+  return [start, end];
+}
+
+export function structuralContext(lines: string[], idx: number): StructuralContext {
+  const [start] = segmentRange(lines, idx);
+  const upto = lines.slice(start, idx + 1).join("\n");
+  if (EVIDENCE_LABEL_RE.test(upto)) return { framed: true, kind: "labeled evidence or output excerpt" };
+  if (REPORT_LABEL_RE.test(lines[start]) || REPORT_LABEL_RE.test(lines[idx])) {
+    return { framed: true, kind: "report section label" };
+  }
+  if (FINDING_LISTING_RE.test(lines[idx])) return { framed: true, kind: "finding listing" };
+  const segText = lines.slice(start, segmentRange(lines, idx)[1] + 1).join("\n");
+  const problemRef = /^\s*[-*]?\s*P-\d{3}\b/.test(lines[start]);
+  const changelogDoc = lines.slice(0, idx + 1).some((l) => VERSION_HEADING_RE.test(l));
+  if ((problemRef || changelogDoc) && FIX_NARRATION_RE.test(segText)) {
+    return { framed: true, kind: "changelog or problem entry fix note" };
+  }
+  return { framed: false, kind: "" };
 }
 
 export interface QuoteContext { framed: boolean; spans: QuotedSpan[] }
@@ -283,6 +373,12 @@ export function framedQuotation(lines: string[], idx: number): QuoteContext {
   };
   if (spans.length > 0) {
     if (hasAttributionFraming(line.slice(0, spans[0].start)) || framingNear() || framingAfter()) {
+      return { framed: true, spans };
+    }
+    // P-066: structural attribution (a labeled excerpt, a report
+    // section label, a fix-note narration in the same segment) frames
+    // a quoted span the same way a framing sentence does.
+    if (structuralContext(lines, idx).framed) {
       return { framed: true, spans };
     }
   }
@@ -380,12 +476,19 @@ export function matchExfilConstruction(text: string): string | null {
   return null;
 }
 
-/** Offset of the read that anchors an exfil construction in a fragment. */
+/**
+ * Offset of the read that anchors an exfil construction in a fragment.
+ * The offset is in the caller's coordinates: the fragment is matched
+ * as given, NOT re-collapsed, because callers map the offset back to
+ * a line in the text they passed. (Re-collapsing here shifted the
+ * anchor lines early in documents with indented continuation lines,
+ * which in turn misattributed the flattened construction's line and
+ * its documentation context, P-066.)
+ */
 export function constructionAnchor(text: string): number {
-  const flat = text.replace(/\s+/g, " ");
-  const cred = CRED_READ.exec(flat);
+  const cred = CRED_READ.exec(text);
   if (cred) return cred.index;
-  const dump = ENV_DUMP.exec(flat);
+  const dump = ENV_DUMP.exec(text);
   return dump ? dump.index : -1;
 }
 
@@ -422,18 +525,28 @@ function matchHiddenUnicode(line: string): UnicodeHit | null {
   let bidi = 0;
   let tags = 0;
   let variation = 0;
+  // P-013: severity scales with density and clustering. An invisible
+  // character embedded inside a word (a letter or digit on both
+  // sides) is concealment shaped: it splits a word a human reads as
+  // whole. Isolated characters at word or sentence boundaries are
+  // the sparse shape found in ordinary prose (copy-paste debris,
+  // stray joiners), and grade low however many of them a line holds
+  // below the dense threshold.
+  let embedded = 0;
   const cps = [...line].map((ch) => ch.codePointAt(0)!);
+  const isAlnumCp = (cp: number) => cp > 0 && /[\p{L}\p{N}]/u.test(String.fromCodePoint(cp));
   for (let k = 0; k < cps.length; k++) {
     const cp = cps[k];
     const prev = k > 0 ? cps[k - 1] : 0;
     const next = k + 1 < cps.length ? cps[k + 1] : 0;
-    if (cp === 0x200b || cp === 0x2060 || cp === 0xfeff) zeroWidth++;
+    let counted = false;
+    if (cp === 0x200b || cp === 0x2060 || cp === 0xfeff) { zeroWidth++; counted = true; }
     else if (cp === 0x200c || cp === 0x200d) {
       // Joiner inside an emoji sequence, or joiner/non-joiner flanked by
       // joining-script letters, is grapheme construction, not hiding.
       if (isEmojiCapable(prev) || isEmojiCapable(next)) continue;
       if (isJoiningScript(prev) && isJoiningScript(next)) continue;
-      zeroWidth++;
+      zeroWidth++; counted = true;
     }
     else if ((cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069)) bidi++;
     else if (cp >= 0xe0000 && cp <= 0xe007f) tags++;
@@ -444,15 +557,16 @@ function matchHiddenUnicode(line: string): UnicodeHit | null {
       // is stripped, "#<VS16>-ways-to-contribute"), not stuffing: hidden
       // variation selectors hide inside words, after letters or digits.
       if (cp === 0xfe0f && prev < 0x80 && !/[A-Za-z0-9]/.test(String.fromCodePoint(prev))) continue;
-      variation++;
+      variation++; counted = true;
     }
+    if (counted && isAlnumCp(prev) && isAlnumCp(next)) embedded++;
   }
   if (tags > 0) return { kind: "unicode tag characters", severity: "high", count: tags };
   if (bidi > 0) return { kind: "bidi control characters", severity: "high", count: bidi };
   const invisible = zeroWidth + variation;
   if (invisible >= 5) return { kind: "zero-width / variation-selector characters", severity: "high", count: invisible };
-  if (invisible >= 2) return { kind: "zero-width / variation-selector characters", severity: "medium", count: invisible };
-  if (invisible === 1) return { kind: "zero-width / variation-selector character", severity: "low", count: 1 };
+  if (embedded >= 1) return { kind: "zero-width / variation-selector characters embedded in words", severity: "medium", count: invisible };
+  if (invisible >= 1) return { kind: "zero-width / variation-selector characters", severity: "low", count: invisible };
   return null;
 }
 
@@ -503,13 +617,20 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
 
-/** First tool lure matching a prose line, or null. Shared by the line loop and the comment pass. */
-export function matchToolLure(line: string): { severity: Severity; label: string } | null {
+/** First tool lure matching a prose line, with its match offset, or null. */
+export function matchToolLureAt(line: string): { severity: Severity; label: string; index: number } | null {
   if (isNegativeRunReport(line)) return null;
   for (const lure of TOOL_LURES) {
-    if (lure.re.test(line)) return lure;
+    const m = lure.re.exec(line);
+    if (m) return { severity: lure.severity, label: lure.label, index: m.index };
   }
   return null;
+}
+
+/** First tool lure matching a prose line, or null. Shared by the line loop and the comment pass. */
+export function matchToolLure(line: string): { severity: Severity; label: string } | null {
+  const hit = matchToolLureAt(line);
+  return hit ? { severity: hit.severity, label: hit.label } : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -896,7 +1017,12 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
     // inside quotation marks or a blockquote, with attribution framing,
     // is described rather than issued and grades low.
     const quoteCtx = commented ? { framed: false, spans: [] as QuotedSpan[] } : framedQuotation(lines, i);
-    const inSpan = (pos: number): boolean => quoteCtx.spans.some((s) => pos >= s.start && pos < s.end);
+    // P-066: backtick code spans count as presentation spans too. A
+    // payload exhibited inside backticks in a report (quoted tool
+    // output, an evidence excerpt) is presented the same way a
+    // quoted payload is, once the segment is structurally framed.
+    const allSpans = [...quoteCtx.spans, ...codeSpans(line)];
+    const inSpan = (pos: number): boolean => allSpans.some((s) => pos >= s.start && pos < s.end);
     // A framed line with no quoted spans is the blockquote shape: the
     // whole line is the quotation.
     const wholeLineQuoted = quoteCtx.framed && quoteCtx.spans.length === 0;
@@ -927,8 +1053,15 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
       const construction = matchExfilConstruction(line) ?? (joinedLine ? matchExfilConstruction(joinedLine) : null);
       if (construction && !(exfil && exfil.severity === "high")) {
         const anchor = constructionAnchor(line);
+        const sctx = structuralContext(lines, i);
         if (quoteCtx.framed && (wholeLineQuoted || (anchor >= 0 && inSpan(anchor)))) {
           push(lineNo, "exfil-pattern", "low", line, `Exfil construction inside a payload quoted verbatim with attribution framing (described, not issued): ${construction}`);
+        } else if (sctx.framed) {
+          // P-066: a construction described by a report or changelog
+          // segment (a Method paragraph naming the payload core, a
+          // fix note narrating the payload it fixed) is the segment's
+          // subject, not an instruction to the reader.
+          push(lineNo, "exfil-pattern", "low", line, `Exfil construction described in a structurally attributed context (${sctx.kind}; described, not issued): ${construction}`);
         } else if (isDocContext(line)) {
           push(lineNo, "exfil-pattern", "low", line, `Exfil construction in documentation context (describing the pattern, not issuing it): ${construction}`);
         } else {
@@ -961,9 +1094,9 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
       // sees the line with a split sink token rejoined, and the
       // stronger of the two grades wins.
       const splitJoin = i + 1 < lines.length ? splitToolJoin(line, lines[i + 1]) : null;
-      let lure = matchToolLure(line);
+      let lure = matchToolLureAt(line);
       if (splitJoin) {
-        const joinedLure = matchToolLure(splitJoin.first + splitJoin.second);
+        const joinedLure = matchToolLureAt(splitJoin.first + splitJoin.second);
         if (joinedLure && (!lure || SEVERITY_RANK[joinedLure.severity] > SEVERITY_RANK[lure.severity])) lure = joinedLure;
       }
       if (lure) {
@@ -974,6 +1107,16 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
         // strength through the construction pass.
         if (lure.severity === "medium" && lure.label === "instruction to run a command" && benignCommandContext(lines, i)) {
           push(lineNo, "tool-lure", "low", line, `Tool lure in prose (${lure.label}), but the command in the following fence is benign human setup content (no exfil construction, no credential reference)`);
+        } else if (structuralContext(lines, i).framed && (inSpan(lure.index) || structuralContext(lines, i).kind !== "changelog or problem entry fix note")) {
+          // P-066: a lure exhibited as evidence in a report segment
+          // (inside a quoted or backtick span after an evidence label,
+          // in a finding listing, or under a report section label) is
+          // quoted tool output or another document's line being
+          // judged, not a lure addressed to this reader. A fix-note
+          // narration alone does not downgrade a lure outside a span:
+          // the narration describes rules, it does not exhibit this
+          // command.
+          push(lineNo, "tool-lure", "low", line, `Tool lure in prose (${lure.label}), but exhibited as a quoted excerpt in a structurally attributed report or changelog context (described, not issued)`);
         } else {
           push(lineNo, "tool-lure", lure.severity, line, `Tool lure in prose (${lure.label}); commands belong in code, not in text an agent is told to obey`);
         }
@@ -1118,7 +1261,7 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
         // addressed to an AI. Only a real directive shape survives: an
         // explicit agent address or a second-person imperative.
         if (ADDRESS_LABELS.has(phraseLabel) && isAiAuthorshipText(lines[startLine - 1])) continue;
-        const doc = isQuotedDocContext(lines[startLine - 1]) || isQuotedDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed;
+        const doc = isQuotedDocContext(lines[startLine - 1]) || isQuotedDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
         push(
           startLine,
           "instruction-phrase",
@@ -1155,7 +1298,7 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
       // and workflow YAML pair POST/publish verbs with token nouns across
       // lines constantly; narrative-strength cross-line matches are noise.
       if (!hit || hit.severity !== "high") continue;
-      const doc = isDocContext(lines[startLine - 1]) || isDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed;
+      const doc = isDocContext(lines[startLine - 1]) || isDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
       push(
         startLine,
         "exfil-pattern",
@@ -1176,10 +1319,15 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
     if (construction) {
       const anchor = constructionAnchor(flat);
       const startLine = lineAt(Math.max(0, anchor));
-      const key = `exfil-pattern:${startLine}`;
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed;
+      // Dedup against actual findings, not seenKeys: the cross-line
+      // exfil pass above claims its key before deciding whether its
+      // match is directive enough to report, so a claimed key with no
+      // finding behind it must not suppress the construction finding
+      // at the same line (P-066 anchor fix exposed this on the P-024
+      // fence-split shape, whose construction anchors on the exact
+      // line the exfil pass had claimed and discarded).
+      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
         push(
           startLine,
           "exfil-pattern",
