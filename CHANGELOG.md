@@ -5,8 +5,10 @@
 Fix release closing the injectcheck problems from the overnight
 flywheel Wave A (evasion expansion) and Wave B (real-repo corpus
 expansion) hunts, ledger P-024 to P-030 and P-037 to P-039 in the
-Security Wave validation program. Every fix landed test-first: 23 new
-tests failed on 0.1.4 for exactly the ledger reasons before the fix.
+Security Wave validation program. Every fix landed test-first: 17 of
+the 23 new tests failed on 0.1.4 for exactly the ledger reasons
+before the fix; the rest are positive controls and a guardrail
+regression test added during verification.
 
 - P-024 (BLOCKER): a payload split across a code fence boundary scored
   CLEAN. The exfil construction now also recognizes a credential file
