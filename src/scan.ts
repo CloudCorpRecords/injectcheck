@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.10";
+export const VERSION = "0.1.11";
 
 export const RULES = [
   "hidden-unicode",
@@ -626,6 +626,152 @@ export function constructionAnchor(text: string): number {
 }
 
 /* ------------------------------------------------------------------ */
+/* Provenance comments (P-096)                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-096: GitHub Agentic Workflows (gh-aw) writes a machine-generated
+ * provenance marker into issue and PR bodies: a single HTML comment
+ * naming the workflow, the engine, and a run URL. It is metadata about
+ * who produced the body, not an instruction to any reader, human or
+ * agent. A comment with that shape (the gh-aw marker, an engine field,
+ * and a run field holding a URL) is provenance-shaped: a tool lure
+ * inside it counts only at high severity (a real command shape, such
+ * as a curl pipe), never at the medium grade the bare "run:" plus URL
+ * token used to draw. Instruction, exfil, and decoded-content hits
+ * inside a provenance-shaped comment are untouched: a provenance
+ * comment that also carries a real instruction still fires.
+ */
+export function isProvenanceComment(body: string): boolean {
+  const b = body.trim();
+  return /^gh-aw-agentic-workflow\s*:/i.test(b) && /\bengine\s*:/i.test(b) && /\brun\s*:\s*https?:\/\//i.test(b);
+}
+
+/* ------------------------------------------------------------------ */
+/* OAuth protocol constants in fenced code (P-097)                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-097: OAuth and OIDC protocol constants are credential-shaped
+ * strings that are not credentials. The grant type client_credentials,
+ * its sibling grant, response-type, scope, and token-endpoint auth
+ * constants (client_secret_basic, private_key_jwt, id_token, and the
+ * rest below), and OAuth metadata field names appear in textbook
+ * repro code in every auth repository. When such a constant sits
+ * inside a fenced code block and the nearby exfil verb is a code
+ * identifier (a call, send(200, ...), not an action performed on
+ * credential data), the pairing is a protocol literal being compared
+ * or returned, not data being moved, and the flattened exfil pass
+ * discounts it. All three conditions are required: the same shape
+ * outside a fence, in prose aimed at an agent, keeps its grade, and
+ * fenced code carrying real credential targets (files, env secrets)
+ * is untouched because those nouns are not protocol constants.
+ */
+const OAUTH_PROTOCOL_TOKENS = new Set([
+  "client_credentials", "authorization_code", "refresh_token", "password",
+  "implicit", "device_code", "urn:ietf:params:oauth:grant-type:device_code",
+  "client_secret_basic", "client_secret_post", "client_secret_jwt",
+  "private_key_jwt", "tls_client_auth", "self_signed_tls_client_auth",
+  "token", "id_token", "access_token", "code_token", "code_id_token",
+  "id_token_token", "code_id_token_token", "bearer", "openid",
+  "offline_access", "token_type",
+]);
+
+export function isOAuthProtocolToken(token: string): boolean {
+  const t = token.toLowerCase();
+  if (OAUTH_PROTOCOL_TOKENS.has(t)) return true;
+  if (/^(client_|grant_|response_|token_endpoint|scopes?_)/.test(t)) return true;
+  // A dotted access (data.access_token) names the constant in its last
+  // segment.
+  const segments = t.split(".");
+  return segments.length > 1 && OAUTH_PROTOCOL_TOKENS.has(segments[segments.length - 1]);
+}
+
+/** The identifier token surrounding text[index], when it is an OAuth protocol constant. */
+export function oauthConstantTokenAt(text: string, index: number): string | null {
+  let s = index;
+  while (s > 0 && /[A-Za-z0-9_\-.]/.test(text[s - 1])) s--;
+  let e = index;
+  while (e < text.length && /[A-Za-z0-9_\-.]/.test(text[e])) e++;
+  const tok = text.slice(s, e);
+  return tok && isOAuthProtocolToken(tok) ? tok : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Parameter-channel exfiltration (P-099)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-099: the canonical MCP tool-poisoning shape moves credential data
+ * out through a tool PARAMETER, not through a URL, a curl command, or
+ * a tracked transfer verb near a credential noun: a tool description
+ * directs the reader to read credential-class files and pass their
+ * contents as a named argument, and not to mention the read. No
+ * single element of that shape is incriminating (MCP documentation
+ * mentions reading files and parameters everywhere), so the rule is
+ * the combination, all inside one window of flattened text:
+ *
+ * - a concrete credential-class file target (~/.ssh/id_rsa,
+ *   ~/.aws/credentials, ~/.cursor/mcp.json, .env, .npmrc, ...);
+ * - a read verb aimed at that target;
+ * - a content-transfer construction into a named parameter, field,
+ *   or argument (pass/include/add ... contents ... as the X
+ *   argument, or pass ... as the X argument with contents in the
+ *   window);
+ * - corroboration: directive language aimed at the reader (you must,
+ *   before using, an IMPORTANT marker) or suppression and quietness
+ *   language (do not mention, quietly, silently).
+ *
+ * Descriptive third-person narration of the same mechanics (a helper
+ * that reads a key and passes its contents as an argument when it
+ * connects) carries no directive and no suppression and does not
+ * fire, and neither does a parameter transfer of a non-credential
+ * file, a credential read with no parameter channel, or ordinary
+ * tool documentation.
+ */
+const PARAM_CRED_FILE_RE = /(~\/\.ssh\/[\w.\-]+|id_rsa\b|\.aws\/credentials\b|\.aws\/[\w.\-]+|\.env\b|\.npmrc\b|\.cursor\/mcp\.json\b|~\/\.cursor\/[\w.\-]+)/i;
+const PARAM_TRANSFER_CONTENTS_RE = /\b(pass|include|add|put|provide|send|insert|supply)\s+(?:its\s+|their\s+|the\s+)?(?:full\s+)?contents?\b[\s\S]{0,90}?\b(?:as|in|into|to)\b\s+(?:the\s+)?(?:['"`]?[\w-]+['"`]?\s+)?(?:argument|parameter|field|param|input)\b/i;
+const PARAM_TRANSFER_BARE_RE = /\b(pass|include|add|put|provide|send|insert|supply)\b[\s\S]{0,60}?\b(?:as|in|into|to)\b\s+(?:the\s+)?(?:['"`]?[\w-]+['"`]?\s+)?(?:argument|parameter|field|param|input)\b/i;
+// The named-parameter form the canonical payload actually uses: the
+// contents are passed as a quoted name ('sidenote'), with no word
+// argument or parameter after it. The quotation is what marks the
+// word as a slot name rather than ordinary prose. An unquoted name
+// counts only when the same window also declares it inside a
+// parenthesized parameter list (the tool signature shape,
+// add(a, b, sidenote)).
+const PARAM_TRANSFER_QUOTED_NAME_RE = /\b(pass|include|add|put|provide|send|insert|supply)\b[\s\S]{0,120}?\bcontents?\b[\s\S]{0,60}?\b(?:as|in|into|to)\b\s+(?:the\s+)?['"`]([\w-]+)['"`]/i;
+const PARAM_TRANSFER_NAMED_RE = /\b(pass|include|add|put|provide|send|insert|supply)\b[\s\S]{0,120}?\bcontents?\b[\s\S]{0,60}?\b(?:as|in|into|to)\b\s+(?:the\s+)?([a-z_][\w-]*)\b/i;
+const PARAM_SUPPRESSION_RE = /\b(do\s+not|don't|never|without|must\s+not|should\s+not)\b[\s\S]{0,80}?\b(mention|tell|reveal|disclose|say)\b|\b(quietly|silently|secretly)\b/i;
+const PARAM_DIRECTIVE_RE = /\b(you\s+must|you\s+should|you\s+need\s+to|before\s+using|important)\b/i;
+
+export function matchParameterExfil(text: string): { detail: string; index: number } | null {
+  const flat = text.replace(/\s+/g, " ");
+  const cred = PARAM_CRED_FILE_RE.exec(flat);
+  if (!cred) return null;
+  const start = Math.max(0, cred.index - 700);
+  const win = flat.slice(start, Math.min(flat.length, cred.index + 700));
+  const credAt = cred.index - start;
+  const read = /\b(read|open|load|retrieve|cat)\b/i.exec(win);
+  if (!read || Math.abs(read.index - credAt) > 260) return null;
+  const hasContentsTransfer = PARAM_TRANSFER_CONTENTS_RE.test(win);
+  const hasBareTransfer = PARAM_TRANSFER_BARE_RE.test(win) && /\bcontents?\b/i.test(win);
+  let hasNamedTransfer = PARAM_TRANSFER_QUOTED_NAME_RE.test(win);
+  if (!hasNamedTransfer) {
+    const named = PARAM_TRANSFER_NAMED_RE.exec(win);
+    if (named) {
+      const name = named[2].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      hasNamedTransfer = new RegExp(`\\([^)]*\\b${name}\\b[^)]*\\)`, "i").test(win);
+    }
+  }
+  if (!hasContentsTransfer && !hasBareTransfer && !hasNamedTransfer) return null;
+  if (!PARAM_SUPPRESSION_RE.test(win) && !PARAM_DIRECTIVE_RE.test(win)) return null;
+  return {
+    detail: "credential-class file read combined with a content transfer into a named tool parameter (parameter-channel exfiltration), corroborated by directive or suppression language",
+    index: cred.index,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Hidden unicode                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -745,7 +891,13 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   // phrase like "run: the full backend suite" (P-012) is not a command
   // either, so a leading "the" is rejected too. Negative run reports are
   // filtered before this list is consulted at all.
-  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b|the\b)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
+  // P-096: a run: value that is a URL is a label, not a command. CI and
+  // provenance text constantly carries "run: https://.../actions/runs/..."
+  // (a link to a workflow run, including inside gh-aw provenance
+  // comments) and "Detector run: https://..." link labels; neither
+  // instructs a reader to run anything, so a URL value is rejected too.
+  // A command value ("run: curl https://...") still fires.
+  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b|the\b|https?:\/\/|www\.)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
   { re: /\b(install|add)\s+this\s+(package|dependency|module)\s+and\s+(run|execute)\b/i, severity: "medium", label: "install a package and run it" },
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
@@ -871,6 +1023,8 @@ export function scanFragmentForPayload(t: string): string | null {
     if (instr) return `instruction phrase (${instr.label})`;
     const construction = matchExfilConstruction(view);
     if (construction) return `exfil construction (${construction})`;
+    const paramExfil = matchParameterExfil(view);
+    if (paramExfil) return "parameter-channel exfil pattern";
     const exfil = matchExfil(view);
     if (exfil && exfil.severity === "high") return "exfil pattern";
   }
@@ -1217,15 +1371,22 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       let instr: ReturnType<typeof matchInstructionLanguage> = null;
       let exfil: ReturnType<typeof matchExfil> = null;
       let construction: string | null = null;
+      let paramExfil: ReturnType<typeof matchParameterExfil> = null;
       let lure: ReturnType<typeof matchToolLure> = null;
       for (const body of variants) {
         instr = instr ?? matchInstructionLanguage(body);
         const rawExfil = matchExfil(body);
         if (!exfil && rawExfil && rawExfil.severity !== "low") exfil = rawExfil;
         construction = construction ?? matchExfilConstruction(body);
+        paramExfil = paramExfil ?? matchParameterExfil(body);
         const bodyLure = matchToolLure(body);
         if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
       }
+      // P-096: a gh-aw provenance comment is machine-written metadata,
+      // not an instruction. A lure inside it counts only at high
+      // severity (a real command shape); the medium run-plus-URL
+      // token that provenance markers always carry does not fire.
+      if (isProvenanceComment(span.body) && lure && lure.severity !== "high") lure = null;
       // P-026: bounded recursive decoding of the comment body (entity
       // layers and base64 layers composed to MAX_DECODE_DEPTH).
       let decodedHit: string | null = null;
@@ -1239,15 +1400,15 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       if (instr) {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains instruction language (${instr.label}); comments are invisible in rendered output but read by agents`);
       }
-      if (exfil || construction) {
-        push(start, "exfil-pattern", "high", raw, `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction}`);
+      if (exfil || construction || paramExfil) {
+        push(start, "exfil-pattern", "high", raw, `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction ?? paramExfil!.detail}`);
         if (!instr) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains an exfil pattern; comments are invisible in rendered output but read by agents");
         }
       } else if (!instr && lure) {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
       }
-      if (decodedHit && !exfil && !construction) {
+      if (decodedHit && !exfil && !construction && !paramExfil) {
         push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth ${MAX_DECODE_DEPTH})`);
         if (!instr) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains encoded instruction content; comments are invisible in rendered output but read by agents");
@@ -1522,6 +1683,22 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       cleanedLines[i + 1] = sj.second;
     }
   }
+  // P-097: fence state per line, for the flattened passes below. The
+  // per-line pass skips fence content, but the flattened text joins
+  // fence lines with prose, so the flattened exfil pass needs to know
+  // which of its verb and noun positions sit inside a fence.
+  const fenceContent: boolean[] = [];
+  {
+    let inside = false;
+    for (const l of lines) {
+      if (FENCE_DELIM_RE.test(l)) {
+        fenceContent.push(false);
+        inside = !inside;
+      } else {
+        fenceContent.push(inside);
+      }
+    }
+  }
   const flat = cleanedLines.join(" ");
   const offsets: number[] = [];
   {
@@ -1587,8 +1764,59 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     while ((nm = nounRe.exec(flat)) !== null) nounPositions.push({ index: nm.index, text: nm[0] });
     const verbRe = new RegExp(EXFIL_VERB.source, "gi");
     let vm: RegExpExecArray | null;
+    // P-097 discount: a noun that is an OAuth protocol constant, with
+    // both the noun and the verb inside a fenced code block and the
+    // verb used as a code identifier (a call: send(200, ...), or a
+    // member call), is a protocol literal in repro code, not
+    // credential data being moved. The pairing is skipped for that
+    // noun only; any other noun near the same verb still pairs.
+    const oauthFenceDiscount = (n: { index: number; text: string }, v: RegExpExecArray): boolean => {
+      if (!fenceContent[lineAt(n.index) - 1] || !fenceContent[lineAt(v.index) - 1]) return false;
+      if (!oauthConstantTokenAt(flat, n.index)) return false;
+      const after = flat.slice(v.index + v[0].length, v.index + v[0].length + 12);
+      const before = v.index > 0 ? flat[v.index - 1] : "";
+      return /^\s*\(/.test(after) || before === ".";
+    };
+    // P-097, second shape: a response-helper call in fenced code
+    // (send(200, {...}), a status code as the first argument) whose
+    // whole pairing window holds only protocol vocabulary and dummy
+    // fixture literals: an access_token field, a token_type field, a
+    // quoted placeholder value like "token-1". That is a textbook
+    // token response being returned by a mock server, not credential
+    // data being moved. The discount is a combination again: fence,
+    // status-code call shape, every nearby credential-shaped token
+    // discounted on its own merits (protocol constant, or a quoted
+    // short literal that is not a path or a credential-file name),
+    // and no credential-file or environment marker anywhere in the
+    // window. Fenced code that reads a credential file or the
+    // environment anywhere near the verb keeps its grade.
+    const quotedDummyNoun = (n: { index: number; text: string }): boolean => {
+      const line = lineAt(n.index);
+      const segStart = offsets[line - 1];
+      const seg = flat.slice(segStart, segStart + cleanedLines[line - 1].length);
+      const pos = n.index - segStart;
+      for (const q of ["\"", "'", "`"]) {
+        const open = seg.lastIndexOf(q, pos);
+        if (open < 0) continue;
+        const close = seg.indexOf(q, pos + n.text.length);
+        if (close < 0) continue;
+        const lit = seg.slice(open + 1, close);
+        if (/^[\w\s.\-]{1,40}$/.test(lit) && !/(\/|~|ssh|aws|env|credential|id_rsa|\.pem|process|environ)/i.test(lit)) return true;
+      }
+      return false;
+    };
+    const responseHelperDiscount = (v: RegExpExecArray): boolean => {
+      if (!fenceContent[lineAt(v.index) - 1]) return false;
+      const after = flat.slice(v.index + v[0].length, v.index + v[0].length + 14);
+      if (!/^\s*\(\s*[1-5]\d\d\b/.test(after)) return false;
+      const win = flat.slice(Math.max(0, v.index - 90), Math.min(flat.length, v.index + 90));
+      if (/(\.ssh|id_rsa|\.aws|\.env\b|process\.env|os\.environ|readfile|credentials?\s+file)/i.test(win)) return false;
+      const near = nounPositions.filter((n) => Math.abs(n.index - v.index) <= 80);
+      if (near.length === 0) return false;
+      return near.every((n) => fenceContent[lineAt(n.index) - 1] && (oauthConstantTokenAt(flat, n.index) !== null || quotedDummyNoun(n)));
+    };
     while ((vm = verbRe.exec(flat)) !== null) {
-      const noun = nounPositions.find((n) => Math.abs(n.index - vm!.index) <= 80);
+      const noun = nounPositions.find((n) => Math.abs(n.index - vm!.index) <= 80 && !oauthFenceDiscount(n, vm!) && !responseHelperDiscount(vm!));
       if (!noun) continue;
       const startLine = lineAt(Math.min(vm.index, noun.index));
       const endLine = lineAt(Math.max(vm.index, noun.index));
@@ -1642,6 +1870,31 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
           doc ? "low" : "high",
           lines[startLine - 1],
           `Exfil construction (${construction}) detected across lines ${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  // Parameter-channel exfiltration (P-099): the credential file
+  // target, the read directive, the content transfer into a named
+  // parameter, and the suppression or directive corroboration can sit
+  // on different lines of a tool description, so the combination is
+  // matched on the flattened text like the construction above.
+  // Documentation grading follows the construction pass: a quoted,
+  // framed, or structurally attributed description of the shape
+  // grades low instead of high.
+  {
+    const param = matchParameterExfil(flat);
+    if (param) {
+      const startLine = lineAt(Math.max(0, param.index));
+      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+        push(
+          startLine,
+          "exfil-pattern",
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `Parameter-channel exfil pattern (${param.detail}) detected across lines${doc ? ", in documentation context" : ""}`,
         );
       }
     }

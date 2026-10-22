@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.11 (2026-10-22)
+
+Fix release closing three injectcheck problems from the overnight
+flywheel text-at-scale hunt (Hunt Swarm 3: 550 hand-labeled real
+texts, 65 wild payload fixtures): P-096, P-097, and P-099. Every
+fix landed test-first: 26 new tests in test/p096p097p099.test.ts;
+in the first test-first run 11 failed on the 0.1.10 code for
+exactly the ledger reasons, one further test (the quoted
+parameter-name shape the raw wild fixture actually uses) was added
+when the first fix iteration missed that layout, and one more
+(the token-response object shape) when the real OAuth file
+surfaced a second pairing; the rest are controls that passed
+before and after. 254 tests passing in total.
+
+- P-096: GitHub Agentic Workflows provenance comments graded
+  FINDINGS on ordinary PR and issue bodies, and a visible CI link
+  label of the same token family drew a tool-lure medium. The
+  only lure-shaped token was a run field whose value is a URL.
+  The run-colon lure now requires a command value: a URL value is
+  a link label, not a command. A provenance-shaped comment (the
+  gh-aw marker, an engine field, a run URL) counts a lure inside
+  it only at full command strength. Controls: a provenance
+  comment carrying a real instruction still verdicts FINDINGS,
+  the W2 comment curl exfil shape keeps its highs, and run-colon
+  or execute-colon followed by an actual command still fires.
+- P-097: fenced OAuth repro code graded FINDINGS because a
+  response helper named send co-occurred with the grant-type
+  string client_credentials inside a fence. The flattened exfil
+  pass now discounts a pairing when both sides sit inside a
+  fenced block, the credential-shaped token is an OAuth protocol
+  constant, and the verb is a code identifier; a second discount
+  covers the status-code response-helper shape whose whole
+  window is protocol vocabulary and quoted placeholder values,
+  provided no credential-file or environment marker is present.
+  Controls: the same shape in prose aimed at an agent keeps
+  FINDINGS, and fenced code that reads credential files and
+  posts them stays FINDINGS.
+- P-099: the canonical Invariant add-tool payload graded CLEAN
+  in all five layouts: its channel is a tool parameter, and pass
+  and read were not transfer verbs for any rule. The exfil
+  analysis now covers the parameter channel as a combination: a
+  concrete credential-class file target, a read directive aimed
+  at it, a transfer of the contents into a named parameter,
+  field, or argument (including the quoted parameter-name form
+  and a name declared in a tool signature), and directive or
+  suppression language as corroboration. All five wild layouts
+  now verdict FINDINGS. Controls: ordinary MCP tool
+  documentation, a parameter transfer of a non-credential file,
+  a credential read with no parameter channel, and descriptive
+  third-person narration of the same mechanics do not fire.
+- Real-text discipline on the 550-text corpus: the published
+  0.1.10 binary reports 152 findings in 16 files (3 high, 5
+  medium, 144 low); this release reports 148 findings in 12
+  files (0 high, 4 medium, 144 low), with the gh-aw, OAuth, and
+  run-label families cleared and no new file flagged. The
+  remaining mediums are the P-098 incident-report family, out
+  of scope for this release.
+
 ## 0.1.10 (2026-10-22)
 
 Fix release closing six injectcheck problems from the overnight
