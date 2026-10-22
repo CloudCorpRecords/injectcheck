@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.4 (2026-10-22)
+
+Fix release closing the three injectcheck problems from Round 2
+real-repo validation (ledger P-021, P-022, P-023 in the Security Wave
+validation program). Every fix landed test-first.
+
+- P-021: piped CLI output truncated at exactly 65,536 bytes in both
+  renderers, the same emit bug as actionpin P-001 and hookcheck P-017
+  (console.log followed by process.exit discards whatever a piped stdout
+  has not drained). All reports now go through one flush-aware emit
+  helper that resolves in the stdout write callback, exit codes are set
+  with process.exitCode, and a reader that closes the pipe early exits
+  141. Regression tests spawn the real CLI with piped stdio and require
+  a report over 200 KiB to arrive whole and parse, byte-identical for
+  the human renderer.
+- P-022: the cross-line instruction matcher joined an AI-authorship
+  disclosure ("Written with AI") with imperative-mood PR summary prose
+  and reported a medium "imperative addressed to an AI" on legitimate
+  payloadcms PRs 18930 and 18931. Address-shaped matches whose AI
+  mention sits inside an authorship construction (written, drafted,
+  generated, created, and similar, with or by an AI) are now treated as
+  attribution, not address, in both the per-line and cross-line passes.
+  An explicit agent address ("Note for the AI") followed by an
+  imperative still fires. Both real PR openings are regression fixtures
+  and now verdict CLEAN; the other 50 real texts are unchanged.
+- P-023: a security write-up quoting a payload verbatim with
+  attribution framing ("The attacker planted the following text in an
+  issue: '...'") scored FINDINGS with 2 high findings. Payload text
+  inside quotation marks or a blockquote, accompanied by attribution or
+  reporting framing, now grades at the documentation level (low) for
+  the instruction-phrase, exfil-pattern, and exfil-construction rules,
+  in both passes. The framing is required: the same payload without it,
+  or behind only a neutral lead-in, still verdicts FINDINGS.
+
+99 tests passing. Guardrails re-verified: A5 fixture FINDINGS with all
+rule families, the spec control at REVIEW with 4 low findings, wild
+payloads 8 of 8 at FINDINGS, and the labeled dataset slices unchanged
+(legitimate slice still zero FINDINGS).
+
 ## 0.1.3 (2026-10-21)
 
 One grading fix found during the 0.1.2 acceptance run. On the W3

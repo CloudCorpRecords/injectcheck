@@ -32,6 +32,12 @@ Instruction-phrase grading, the choice stated plainly: an override verb plus a t
 
 Documentation about prompt injection does not verdict FINDINGS by design. The patterns require actual instruction phrasing, exfil shapes, or hidden characters, not the mere mention of the topic, and negated safety advice is reported at low severity so it stays visible without blocking anyone. Two tuning rules keep honest docs honest: an exfil verb near a credential noun only scores high in directive shape (an imperative, a "contents of" request, a URL destination), while third-person narrative about an attack scores low; and instruction phrases quoted inside documentation that describes the patterns (detector docs, security writeups) score low instead of high. This is tested against real documents: the spec this tool was built from scans at REVIEW with only low findings, never FINDINGS.
 
+Quoted payloads in security writing grade as documentation too. A payload that appears inside quotation marks or a blockquote, accompanied by attribution or reporting framing ("The attacker planted the following text in an issue: ...", "A researcher documented the payload ..."), is a payload being described, not one being issued, and its instruction and exfil findings score low. The framing is required: a bare quote with only a neutral lead-in earns no downgrade, and the same payload without the framing verdicts FINDINGS as before.
+
+An AI-authorship disclosure is not an address. A line like "Written with AI" is declarative attribution; when it sits near imperative-mood summary prose (the standard shape of an AI-assisted PR description: "Execute... Preserve... Add..."), the cross-line matcher no longer joins the two into an imperative addressed to an AI. A genuine directive shape still fires: an explicit agent address ("Note for the AI") followed by an imperative, or a second-person imperative aimed at the reader.
+
+CLI output is pipe-safe: reports are written through a flush-aware emit path, so a report larger than one pipe buffer (64 KiB) arrives whole when stdout is a pipe, and a reader that closes the pipe early makes the CLI exit 141 instead of reporting a verdict it did not deliver.
+
 ## Usage
 
 ### CLI
