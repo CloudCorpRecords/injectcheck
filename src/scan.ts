@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.7";
+export const VERSION = "0.1.8";
 
 export const RULES = [
   "hidden-unicode",
@@ -294,6 +294,59 @@ export function codeSpans(line: string): QuotedSpan[] {
  */
 export interface StructuralContext { framed: boolean; kind: string }
 
+/**
+ * P-068: a fence label separated from its fence by a single blank
+ * line. Reports present a verbatim quote of tool output as a fenced
+ * block introduced by a label line ("Evidence (exact):"), and the
+ * conventional layout puts one blank line between the label and the
+ * fence. That blank line is a paragraph break, so the label fell
+ * outside the fence content's segment and the attribution never
+ * reached the payload inside the fence. A label is attribution only
+ * when it frames the fence content as quoted, observed, or exhibited
+ * material: a short line ending in a colon whose head word is one of
+ * the label words below. An instruction-shaped colon line ("Run
+ * this:") is not in the set and frames nothing, and the label must
+ * sit directly above the fence or across exactly one blank line;
+ * two blank lines away is out of reach.
+ */
+const FENCE_LABEL_RE = /^\s*(?:[-*+]\s*)?(evidence|output|example|quote|excerpt|quoted|verbatim|transcript|tool\s+output|command\s+output)\b[^:\n]{0,40}:\s*$/i;
+const FENCE_DELIM_RE = /^\s*(```|~~~)/;
+
+export function isFenceLabelLine(line: string): boolean {
+  return line.trim().length <= 80 && FENCE_LABEL_RE.test(line);
+}
+
+/**
+ * Index of the label line attached to a fence opening at fenceIdx:
+ * the line directly above the fence, or above exactly one blank
+ * line, when that line is a fence label. Otherwise -1.
+ */
+export function fenceLabelIndex(lines: string[], fenceIdx: number): number {
+  let j = fenceIdx - 1;
+  if (j >= 0 && lines[j].trim() === "") j--;
+  if (j >= 0 && isFenceLabelLine(lines[j])) return j;
+  return -1;
+}
+
+/**
+ * If lines[idx] is inside a fenced block, the index of the label
+ * attached to that block's opening fence; otherwise -1. Fence state
+ * is counted from the top of the document, the same way the
+ * per-line pass tracks it.
+ */
+export function fenceLabelForContentLine(lines: string[], idx: number): number {
+  let open = -1;
+  let inside = false;
+  for (let k = 0; k < idx; k++) {
+    if (FENCE_DELIM_RE.test(lines[k])) {
+      inside = !inside;
+      open = inside ? k : -1;
+    }
+  }
+  if (!inside || open < 0) return -1;
+  return fenceLabelIndex(lines, open);
+}
+
 const REPORT_LABEL_RE = /^\s*[-*]?\s*(method|evidence|justification|judgement|judgment|finding|findings|verdict|summary)\b[^:\n]{0,40}:/i;
 const FINDING_LISTING_RE = /^\s*[-*]?\s*(hidden-unicode|html-comment-instruction|instruction-phrase|exfil-pattern|tool-lure|base64-blob|alt-text-instruction)\s*,\s*(high|medium|low)\b/i;
 const FIX_NARRATION_RE = /\b(now\s+(fire|fires|fired|verdicts|scans|scanned|catches|caught|grades|graded)|does not fire|did not fire|no longer\s+(fire|fires|flags|verdicts))\b/i;
@@ -316,6 +369,13 @@ export function segmentRange(lines: string[], idx: number): [number, number] {
     if (nxt.trim() === "" || isHeading(nxt) || isBullet(nxt)) break;
     end++;
   }
+  // P-068: when the segment starts at a fence opening, keep a fence
+  // label attached to the fence across a single blank line, so the
+  // label is part of the fence content's segment.
+  if (start > 0 && FENCE_DELIM_RE.test(lines[start])) {
+    const labelIdx = fenceLabelIndex(lines, start);
+    if (labelIdx >= 0) start = labelIdx;
+  }
   return [start, end];
 }
 
@@ -323,6 +383,13 @@ export function structuralContext(lines: string[], idx: number): StructuralConte
   const [start] = segmentRange(lines, idx);
   const upto = lines.slice(start, idx + 1).join("\n");
   if (EVIDENCE_LABEL_RE.test(upto)) return { framed: true, kind: "labeled evidence or output excerpt" };
+  // P-068: a payload inside a fence whose opening carries an
+  // attribution label (kept in the segment by segmentRange, or found
+  // directly from the fence state when the segment walk stopped
+  // inside the fence) is exhibited material, not an instruction.
+  if (isFenceLabelLine(lines[start]) || fenceLabelForContentLine(lines, idx) >= 0) {
+    return { framed: true, kind: "labeled fence excerpt" };
+  }
   if (REPORT_LABEL_RE.test(lines[start]) || REPORT_LABEL_RE.test(lines[idx])) {
     return { framed: true, kind: "report section label" };
   }

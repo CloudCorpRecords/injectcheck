@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.8 (2026-10-22)
+
+Fix release closing one injectcheck problem from the overnight
+flywheel: P-068, the residual sub-shape recorded by the v0.1.7
+fix pass. Every fix landed test-first: 8 new tests in
+test/waved.test.ts, 2 of which failed on 0.1.7 for exactly the
+ledger reason before the fix (the rest are adversarial
+controls); 169 tests passing in total.
+
+- P-068: structural attribution worked when an evidence label
+  and its quoted payload shared a segment, but a fenced verbatim
+  quote of tool output under an "Evidence (exact):" label still
+  graded high when a blank line separated the label from the
+  fence: the label landed outside the payload's segment, so the
+  attribution never reached it. Segment construction around
+  fenced blocks now keeps a directly preceding label line
+  attached to the fence's segment across a single blank line
+  when the line is label-shaped: short, ending in a colon, and
+  headed by an attribution word (Evidence, Output, Example,
+  Quote, Excerpt, and similar words that frame the fence content
+  as quoted, observed, or exhibited material). Payload text
+  inside such a labeled fence now grades low for the
+  instruction-phrase, exfil-pattern, and exfil-construction
+  rules, the same grade as the other P-066 exhibits. The guards
+  are pinned as adversarial controls: a bare payload in a fence
+  with no label still verdicts FINDINGS at high; a label that is
+  itself an instruction ("Run this:") followed by a payload
+  fence still verdicts FINDINGS, because an instruction-shaped
+  label is not attribution; instructional prose above a fence
+  (the P-024 fence-split shape) still verdicts FINDINGS; a
+  label two blank lines above the fence is out of reach; and a
+  non-attribution colon line frames nothing.
+
 ## 0.1.7 (2026-10-22)
 
 Fix release closing two injectcheck problems from the overnight
