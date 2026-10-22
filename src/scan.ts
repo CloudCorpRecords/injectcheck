@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.12";
+export const VERSION = "0.1.13";
 
 export const RULES = [
   "hidden-unicode",
@@ -179,10 +179,10 @@ function matchInstructionRaw(text: string): InstructionHit | null {
  * hit wins ties, so untransformed text keeps its exact current
  * grading, labels, and offsets.
  */
-export function matchInstructionLanguageAt(text: string): InstructionHit | null {
+export function matchInstructionLanguageAt(text: string, preNormalized?: string): InstructionHit | null {
   const raw = matchInstructionRaw(text);
   if (raw && raw.severity === "high") return raw;
-  const normalized = normalizeForMatching(text);
+  const normalized = preNormalized ?? normalizeForMatching(text);
   if (normalized === text) return raw;
   const folded = matchInstructionRaw(normalized);
   if (!folded) return raw;
@@ -415,23 +415,116 @@ const FINDING_LISTING_RE = /^\s*[-*]?\s*(hidden-unicode|html-comment-instruction
 const FIX_NARRATION_RE = /\b(now\s+(fire|fires|fired|verdicts|scans|scanned|catches|caught|grades|graded)|does not fire|did not fire|no longer\s+(fire|fires|flags|verdicts))\b/i;
 const VERSION_HEADING_RE = /^\s*#{1,3}\s+\[?v?\d+\.\d+\.\d+/;
 
+/* ------------------------------------------------------------------ */
+/* Segment and context caching (P-080)                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-080: the context functions (segmentRange, structuralContext,
+ * segmentNarrativeCue, framedQuotation) used to walk and join the
+ * whole segment for every line that needed them. On a document with
+ * few paragraph breaks the segment is the document, so a file whose
+ * lines each drew a hit cost quadratic time in segment walks and
+ * joins. The boundaries and the per-segment facts are computed once
+ * per lines array (the recurrences below are exactly the walks they
+ * replace; the test suite pins equivalence against the walking
+ * implementation on randomized documents) and memoized in a WeakMap
+ * keyed by the array, so repeated context lookups are O(1) and the
+ * first pass over an array is O(n).
+ */
+const SEG_BULLET_RE = /^\s*(?:[-*+]\s|\d+[.)]\s)/;
+const SEG_HEADING_RE = /^\s*#{1,6}\s/;
+
+interface SegInfo { evidenceFirstEnd: number; fixNarration: boolean; prefixLens: number[] }
+
+interface LinesCache {
+  starts: number[];
+  ends: number[];
+  versionPrefix: boolean[];
+  fenceLabelForContent: number[];
+  structural: Map<number, StructuralContext>;
+  narrative: Map<string, boolean>;
+  framed: Map<number, QuoteContext>;
+  segInfo: Map<string, SegInfo>;
+}
+
+const linesCache = new WeakMap<string[], LinesCache>();
+
+function cacheFor(lines: string[]): LinesCache {
+  const hit = linesCache.get(lines);
+  if (hit) return hit;
+  const n = lines.length;
+  const starts = new Array<number>(n);
+  const ends = new Array<number>(n);
+  const versionPrefix = new Array<boolean>(n);
+  const fenceLabelForContentArr = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    if (i === 0) starts[i] = 0;
+    else {
+      const prev = lines[i - 1];
+      if (prev.trim() === "" || SEG_HEADING_RE.test(prev)) starts[i] = i;
+      else if (SEG_BULLET_RE.test(prev)) starts[i] = i - 1;
+      else starts[i] = starts[i - 1];
+    }
+    versionPrefix[i] = (i > 0 && versionPrefix[i - 1]) || VERSION_HEADING_RE.test(lines[i]);
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    if (i === n - 1) ends[i] = i;
+    else {
+      const nxt = lines[i + 1];
+      if (nxt.trim() === "" || SEG_HEADING_RE.test(nxt) || SEG_BULLET_RE.test(nxt)) ends[i] = i;
+      else ends[i] = ends[i + 1];
+    }
+  }
+  {
+    let inside = false;
+    let open = -1;
+    for (let i = 0; i < n; i++) {
+      fenceLabelForContentArr[i] = inside && open >= 0 ? fenceLabelIndex(lines, open) : -1;
+      if (FENCE_DELIM_RE.test(lines[i])) {
+        inside = !inside;
+        open = inside ? i : -1;
+      }
+    }
+  }
+  const cache: LinesCache = {
+    starts, ends, versionPrefix,
+    fenceLabelForContent: fenceLabelForContentArr,
+    structural: new Map(), narrative: new Map(), framed: new Map(), segInfo: new Map(),
+  };
+  linesCache.set(lines, cache);
+  return cache;
+}
+
+function segInfoFor(lines: string[], start: number, end: number): SegInfo {
+  const cache = cacheFor(lines);
+  const key = `${start}:${end}`;
+  const hit = cache.segInfo.get(key);
+  if (hit) return hit;
+  const joined = lines.slice(start, end + 1).join("\n");
+  const m = EVIDENCE_LABEL_RE.exec(joined);
+  const prefixLens: number[] = [];
+  {
+    let acc = 0;
+    for (let i = start; i <= end; i++) {
+      acc += lines[i].length + (i > start ? 1 : 0);
+      prefixLens.push(acc);
+    }
+  }
+  const info: SegInfo = {
+    evidenceFirstEnd: m ? m.index + m[0].length : Number.POSITIVE_INFINITY,
+    fixNarration: FIX_NARRATION_RE.test(joined),
+    prefixLens,
+  };
+  cache.segInfo.set(key, info);
+  return info;
+}
+
 /** The bullet or paragraph segment containing lines[idx]. */
 export function segmentRange(lines: string[], idx: number): [number, number] {
-  const isBullet = (l: string) => /^\s*(?:[-*+]\s|\d+[.)]\s)/.test(l);
-  const isHeading = (l: string) => /^\s*#{1,6}\s/.test(l);
-  let start = idx;
-  while (start > 0) {
-    const prev = lines[start - 1];
-    if (prev.trim() === "" || isHeading(prev)) break;
-    start--;
-    if (isBullet(lines[start])) break;
-  }
-  let end = idx;
-  while (end + 1 < lines.length) {
-    const nxt = lines[end + 1];
-    if (nxt.trim() === "" || isHeading(nxt) || isBullet(nxt)) break;
-    end++;
-  }
+  const cache = cacheFor(lines);
+  let start = cache.starts[idx];
+  const end = cache.ends[idx];
   // P-068: when the segment starts at a fence opening, keep a fence
   // label attached to the fence across a single blank line, so the
   // label is part of the fence content's segment.
@@ -443,24 +536,33 @@ export function segmentRange(lines: string[], idx: number): [number, number] {
 }
 
 export function structuralContext(lines: string[], idx: number): StructuralContext {
-  const [start] = segmentRange(lines, idx);
-  const upto = lines.slice(start, idx + 1).join("\n");
-  if (EVIDENCE_LABEL_RE.test(upto)) return { framed: true, kind: "labeled evidence or output excerpt" };
+  const cache = cacheFor(lines);
+  const memo = cache.structural.get(idx);
+  if (memo) return memo;
+  const result = structuralContextUncached(lines, idx, cache);
+  cache.structural.set(idx, result);
+  return result;
+}
+
+function structuralContextUncached(lines: string[], idx: number, cache: LinesCache): StructuralContext {
+  const [start, end] = segmentRange(lines, idx);
+  const info = segInfoFor(lines, start, end);
+  const uptoLen = info.prefixLens[idx - start] ?? 0;
+  if (info.evidenceFirstEnd <= uptoLen) return { framed: true, kind: "labeled evidence or output excerpt" };
   // P-068: a payload inside a fence whose opening carries an
   // attribution label (kept in the segment by segmentRange, or found
   // directly from the fence state when the segment walk stopped
   // inside the fence) is exhibited material, not an instruction.
-  if (isFenceLabelLine(lines[start]) || fenceLabelForContentLine(lines, idx) >= 0) {
+  if (isFenceLabelLine(lines[start]) || cache.fenceLabelForContent[idx] >= 0) {
     return { framed: true, kind: "labeled fence excerpt" };
   }
   if (REPORT_LABEL_RE.test(lines[start]) || REPORT_LABEL_RE.test(lines[idx])) {
     return { framed: true, kind: "report section label" };
   }
   if (FINDING_LISTING_RE.test(lines[idx])) return { framed: true, kind: "finding listing" };
-  const segText = lines.slice(start, segmentRange(lines, idx)[1] + 1).join("\n");
   const problemRef = /^\s*[-*]?\s*P-\d{3}\b/.test(lines[start]);
-  const changelogDoc = lines.slice(0, idx + 1).some((l) => VERSION_HEADING_RE.test(l));
-  if ((problemRef || changelogDoc) && FIX_NARRATION_RE.test(segText)) {
+  const changelogDoc = cache.versionPrefix[idx];
+  if ((problemRef || changelogDoc) && info.fixNarration) {
     return { framed: true, kind: "changelog or problem entry fix note" };
   }
   return { framed: false, kind: "" };
@@ -482,9 +584,15 @@ export function structuralContext(lines: string[], idx: number): StructuralConte
 const NARRATIVE_SEGMENT_RE = /\b(quot\w+|describ\w+|narrat\w+|report\w+|evidence|excerpt|justification|variants?|phrases?|listing|listed)\b|\bnow\s+(covers?|covered|includes?)\b|\bfamily\s+now\b/i;
 
 export function segmentNarrativeCue(lines: string[], idx: number): boolean {
+  const cache = cacheFor(lines);
   const [start, end] = segmentRange(lines, idx);
+  const key = `${start}:${end}`;
+  const memo = cache.narrative.get(key);
+  if (memo !== undefined) return memo;
   const seg = lines.slice(start, end + 1).join(" ");
-  return NARRATIVE_SEGMENT_RE.test(seg) || NARRATIVE_SEGMENT_RE.test(cueNormalize(seg));
+  const result = NARRATIVE_SEGMENT_RE.test(seg) || NARRATIVE_SEGMENT_RE.test(cueNormalize(seg));
+  cache.narrative.set(key, result);
+  return result;
 }
 
 export interface QuoteContext { framed: boolean; spans: QuotedSpan[] }
@@ -506,6 +614,15 @@ export interface QuoteContext { framed: boolean; spans: QuotedSpan[] }
  * required: a quote followed by unrelated prose earns no downgrade.
  */
 export function framedQuotation(lines: string[], idx: number): QuoteContext {
+  const cache = cacheFor(lines);
+  const memo = cache.framed.get(idx);
+  if (memo) return memo;
+  const result = framedQuotationUncached(lines, idx);
+  cache.framed.set(idx, result);
+  return result;
+}
+
+function framedQuotationUncached(lines: string[], idx: number): QuoteContext {
   const line = lines[idx];
   const spans = quotedSpans(line);
   const framingNear = (): boolean => {
@@ -615,10 +732,10 @@ function matchExfilRaw(line: string): { severity: Severity; detail: string } | n
  * downgrades are computed on the variant being matched), then the
  * stronger grade wins; the raw hit wins ties.
  */
-function matchExfil(line: string): { severity: Severity; detail: string } | null {
+function matchExfil(line: string, preNormalized?: string): { severity: Severity; detail: string } | null {
   const raw = matchExfilRaw(line);
   if (raw && raw.severity === "high") return raw;
-  const normalized = normalizeForMatching(line);
+  const normalized = preNormalized ?? normalizeForMatching(line);
   if (normalized === line) return raw;
   const folded = matchExfilRaw(normalized);
   if (!folded) return raw;
@@ -837,6 +954,143 @@ export function matchParameterExfil(text: string): { detail: string; index: numb
 }
 
 /* ------------------------------------------------------------------ */
+/* Frontier channels (P-100 to P-103)                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Frontier design pass: four payload families the 0.1.12 rule set had
+ * no pattern for, each a deterministic combination on flattened text,
+ * never a single token. Full design note:
+ * ~/workspace/security-wave/injectcheck-frontier-design.md
+ *
+ * - P-100 render-channel: data leaves through rendered output (an
+ *   image per character, a markdown image URL, a reference link)
+ *   after an encode step, or through a hidden container carrying
+ *   private data into a rendered link.
+ * - P-101 behavior-hijack: suppression paired with user-data movement
+ *   to a third-party destination; a credential-class table whose
+ *   contents are transferred into a message; recipient-field
+ *   substitution naming a concrete third-party address.
+ * - P-102 one-time-code theft: a one-time-code noun plus reading the
+ *   code from the mailbox plus posting it outward. Spoiler and
+ *   details regions are concealed text: scanned at full strength,
+ *   never skipped.
+ * - P-103 destructive instruction set: agent-goal framing plus
+ *   destructive verbs over at least two estate-scale targets plus
+ *   an execution-scope marker. Bare fenced commands with no goal
+ *   framing stay documentation.
+ */
+const FRONTIER_SUPPRESS_RE = /\b(do\s+not|don't|never)\s+(mention|tell|reveal|disclose)\b|\bwithout\s+(mentioning|telling|saying)\b/i;
+const FRONTIER_DATA_NOUN_RE = /(source code|private files?|chat history|conversation history|internal notes|email address|phone number|most recent emails|user'?s (?:emails|chats|messages|contacts))/i;
+
+export interface FrontierHit { rule: string; detail: string; index: number }
+
+function flattenWs(text: string): string {
+  // Fast path: already-flat text (single spaces, no line breaks)
+  // needs no copy. The frontier matchers receive pre-flattened text
+  // from matchFrontier and from the flattened document pass, so this
+  // keeps a 20 MB document from being re-copied once per matcher.
+  if (!/[\n\r\t]| {2}/.test(text)) return text;
+  return text.replace(/\s+/g, " ");
+}
+
+export function matchRenderExfil(text: string): FrontierHit | null {
+  const flat = flattenWs(text);
+  // Branch A: encode then render.
+  const encode = /\bencod\w+\b|\bbase(?:16|32|64)\b|\blookup table\b/i.exec(flat) ?? /\bENCODED\b/.exec(flat);
+  if (encode) {
+    const win = flat.slice(Math.max(0, encode.index - 1000), Math.min(flat.length, encode.index + 1000));
+    const renderVerb = /\b(render|include|embed|insert|add|present|output)\b/i.test(win);
+    const renderTarget = /\b(images?|markdown image|links?|reference link)\b/i.test(win);
+    const dataNoun = EXFIL_NOUN.test(win) || FRONTIER_DATA_NOUN_RE.test(win);
+    if (renderVerb && renderTarget && dataNoun) {
+      return { rule: "exfil-pattern", detail: "render-channel exfiltration: credential or private data encoded and rendered or included as an image or link in the reply (render-channel exfiltration)", index: encode.index };
+    }
+  }
+  // Branch B: hidden container or suppression carrying data into a
+  // rendered link or markdown image.
+  const hidden = /(display\s*:\s*none|color\s*:\s*white|font-size\s*:\s*0(px)?\b)/i.exec(flat);
+  const anchor = hidden ?? FRONTIER_SUPPRESS_RE.exec(flat);
+  if (anchor) {
+    const win = flat.slice(Math.max(0, anchor.index - 1000), Math.min(flat.length, anchor.index + 1000));
+    const rendered = /\b(markdown image|reference link)\b/i.test(win) || /!\[[^\]]*\]\(https?:/i.test(win);
+    const moveVerb = /\b(include|add|embed|gather|collect|insert)\b/i.test(win);
+    if (rendered && moveVerb && FRONTIER_DATA_NOUN_RE.test(win)) {
+      return { rule: "exfil-pattern", detail: "render-channel exfiltration: private data carried into a rendered link or markdown image from a hidden container or under suppression (render-channel exfiltration)", index: anchor.index };
+    }
+  }
+  return null;
+}
+
+export function matchBehaviorHijack(text: string): FrontierHit | null {
+  const flat = flattenWs(text);
+  // Branch 1: suppression plus user-data movement to a third party.
+  const suppress = FRONTIER_SUPPRESS_RE.exec(flat);
+  if (suppress) {
+    const win = flat.slice(Math.max(0, suppress.index - 1200), Math.min(flat.length, suppress.index + 1200));
+    const move = /\b(forward|send|post|share|transmit)\b/i.test(win);
+    const userData = /(chat history|conversation history|entire (?:chat|message)|full (?:chat|message)|chat|messages?|emails?|contacts?)/i.test(win);
+    const dest = /(\+\d[\d\s]{6,}\d|[\w.+-]+@[\w-]+\.[\w.]+|third[- ]party|external\s+(?:number|address|account|party))/i.test(win);
+    if (move && userData && dest) {
+      return { rule: "exfil-pattern", detail: "behavior-hijack: user data moved to a third-party destination under suppression (behavior-hijack, suppression plus data movement)", index: suppress.index };
+    }
+  }
+  // Branch 2: credential-class table contents transferred into a message.
+  const table = /\b(read|query|select|open|access)\b[\s\S]{0,80}?([a-z0-9_]*?(?:tokens?|credentials?|secrets?|api_?keys?)[a-z0-9_]*)\s+table\b/i.exec(flat);
+  if (table) {
+    const win = flat.slice(Math.max(0, table.index - 400), Math.min(flat.length, table.index + 700));
+    const transfer = /\b(add|post|include|send|put|paste)\b[\s\S]{0,90}?\b(all\s+(?:the\s+)?contents|contents|entries|rows)\b[\s\S]{0,90}?\b(new message|message|reply|ticket|post|thread)\b/i.test(win);
+    const directive = /\b(you\s+should|you\s+must|important|instructions?\s+for)\b/i.test(win);
+    if (transfer && directive) {
+      return { rule: "exfil-pattern", detail: "behavior-hijack: credential-class table contents read and transferred into a new message (behavior-hijack, credential-class table transfer)", index: table.index };
+    }
+  }
+  // Branch 3: recipient-field substitution with a concrete address.
+  const email = /[\w.+-]+@[\w-]+\.[\w.]+/.exec(flat);
+  if (email && /\b(always|whenever|every time)\b/i.test(flat) &&
+    /\b(put|use|set|insert|place)\b/i.test(flat) &&
+    /\b(recipient|to|cc|bcc)\s+(field|line|address)\b/i.test(flat) &&
+    /\binstead of\b[\s\S]{0,90}?\b(user|actual|real|given|provided)\b/i.test(flat)) {
+    return { rule: "exfil-pattern", detail: "behavior-hijack: recipient field substitution naming a concrete third-party address instead of the user-provided address (behavior-hijack, tool shadowing with field substitution)", index: email.index };
+  }
+  return null;
+}
+
+export function matchOtpTheft(text: string): FrontierHit | null {
+  const flat = flattenWs(text);
+  const otp = /\b(one[- ]time\s+(?:code|passcode|password)|verification code|login code|otp|2fa code|passcode)\b/i.exec(flat);
+  if (!otp) return null;
+  // Negated safety advice ("never share your one-time code") is
+  // documentation, not theft.
+  if (/\b(never|do\s+not|don't|must\s+not|should\s+not)\b[\s\S]{0,40}?\b(share|send|post|reveal|give)\b/i.test(flat)) return null;
+  const source = /\b(start|begin|initiate)\b[\s\S]{0,90}?\blog ?in\b/i.test(flat) ||
+    /\b(read|open|get|fetch|check|retrieve)\b[\s\S]{0,110}?\b(gmail|inbox|e?mail|sms|messages?)\b/i.test(flat);
+  const disclose = /\b(post|send|share|reply|publish)\b[\s\S]{0,130}?\b(code|both)\b/i.test(flat);
+  if (!source || !disclose) return null;
+  const concealed = />!|<details\b/i.test(text) ? " concealed in a spoiler or details region (concealed text is scanned at full strength)" : "";
+  return { rule: "exfil-pattern", detail: `one-time-code theft: a one-time or verification code is read from the mailbox and posted outward (one-time-code theft)${concealed}`, index: otp.index };
+}
+
+export function matchDestructiveDirective(text: string): FrontierHit | null {
+  const flat = flattenWs(text);
+  const goal = /\b(your goal is|you are an ai agent|your task is|you are an agent\b|agent with access to)\b/i.exec(flat);
+  if (!goal) return null;
+  if (!/\b(delete|wipe|destroy|clear|remove)\b/i.test(flat)) return null;
+  const targets = [/file[-\s]?system/i, /\bs3\b/i, /\bec2\b/i, /\biam\b/i, /configuration files?/i, /cloud resources?/i, /home director/i]
+    .filter((re) => re.test(flat)).length;
+  if (targets < 2) return null;
+  const scope = /\b(run continuously|continuously until|until the task is complete|near[- ]factory|factory state|home directory)\b/i.test(flat);
+  if (!scope) return null;
+  return { rule: "instruction-phrase", detail: "destructive instruction set: agent-goal framing with destructive verbs over estate-scale targets and a persistence or scope marker (destructive instruction set)", index: goal.index };
+}
+
+/** First frontier-channel hit in a fragment, in class order. */
+export function matchFrontier(text: string): FrontierHit | null {
+  const flat = flattenWs(text);
+  return matchRenderExfil(flat) ?? matchBehaviorHijack(flat) ?? matchOtpTheft(flat) ?? matchDestructiveDirective(flat);
+}
+
+/* ------------------------------------------------------------------ */
 /* Hidden unicode                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -865,6 +1119,9 @@ function isJoiningScript(cp: number): boolean {
 }
 
 function matchHiddenUnicode(line: string): UnicodeHit | null {
+  // P-080 fast path: no invisible-range codepoint, no finding; this
+  // skips the per-line codepoint array on ordinary text.
+  if (!INVISIBLE_CHARS_RE.test(line)) return null;
   let zeroWidth = 0;
   let bidi = 0;
   let tags = 0;
@@ -1030,11 +1287,11 @@ function matchToolLureRaw(line: string): { severity: Severity; label: string; in
  * pass and takes the stronger of the raw and normalized grades;
  * the negative run-report guard (P-012) applies to both views.
  */
-export function matchToolLureAt(line: string): { severity: Severity; label: string; index: number } | null {
+export function matchToolLureAt(line: string, preNormalized?: string): { severity: Severity; label: string; index: number } | null {
   if (isNegativeRunReport(line)) return null;
   const raw = matchToolLureRaw(line);
   if (raw && raw.severity === "high") return raw;
-  const normalized = normalizeForMatching(line);
+  const normalized = preNormalized ?? normalizeForMatching(line);
   if (normalized === line) return raw;
   if (isNegativeRunReport(normalized)) return raw;
   const folded = matchToolLureRaw(normalized);
@@ -1108,6 +1365,7 @@ function safeCodePoint(cp: number, raw: string): string {
  * does the same.
  */
 export function decodeEntities(s: string): string {
+  if (!s.includes("&")) return s;
   return s
     .replace(/&#x([0-9a-fA-F]+);?/g, (raw, hex: string) => safeCodePoint(parseInt(hex, 16), raw))
     .replace(/&#(\d+);?/g, (raw, dec: string) => safeCodePoint(parseInt(dec, 10), raw))
@@ -1134,6 +1392,8 @@ export function scanFragmentForPayload(t: string): string | null {
     if (construction) return `exfil construction (${construction})`;
     const paramExfil = matchParameterExfil(view);
     if (paramExfil) return "parameter-channel exfil pattern";
+    const frontier = matchFrontier(view);
+    if (frontier) return `frontier pattern (${frontier.detail})`;
     const exfil = matchExfil(view);
     if (exfil && exfil.severity === "high") return "exfil pattern";
   }
@@ -1173,6 +1433,12 @@ export function joinedBlobRuns(s: string): JoinedBlob[] {
   let m: RegExpExecArray | null;
   while ((m = tokenRe.exec(s)) !== null) {
     const raw = m[0];
+    // P-080 fast path: a token shorter than 12 chars can never hold
+    // a fragment core of 12 or more, so it is a run breaker as-is.
+    if (raw.length < 12) {
+      toks.push({ core: "", index: m.index });
+      continue;
+    }
     const core = raw.replace(/^[^A-Za-z0-9+/\-_]+/, "").replace(/[^A-Za-z0-9+/\-_=]+$/, "");
     if (core.length >= 12 && /^[A-Za-z0-9+/\-_]+={0,2}$/.test(core) && core.length >= raw.length - 6) {
       toks.push({ core: core.replace(/=+$/, ""), index: m.index + raw.indexOf(core) });
@@ -1329,6 +1595,12 @@ function matchUrlQueryOn(line: string): { label: string; fragment: string } | nu
  * exactly as before.
  */
 function matchUrlQuery(line: string): { label: string; fragment: string } | null {
+  // P-080 gate: every view this matcher builds can only contain a
+  // query string if the raw line carries a literal question mark or
+  // a numeric entity that decodes to one (&#63; / &#x3f;). Lines
+  // without either cannot match, so the per-line view construction
+  // (including a full surface normalization) is skipped for them.
+  if (!line.includes("?") && !/&#0*63;?/.test(line) && !/&#x0*3f;?/i.test(line)) return null;
   const views = [line];
   const ent = decodeEntities(line);
   if (ent !== line) views.push(ent);
@@ -1396,6 +1668,16 @@ export function benignCommandContext(lines: string[], idx: number): boolean {
 const SPLITTABLE_TOOL_TOKENS = new Set(["nc", "ncat", "curl", "wget", "base64", "printenv", "cat", "bash", "sh"]);
 
 export function splitToolJoin(line: string, next: string): { first: string; second: string } | null {
+  // P-080 fast path: a split token needs a letter as the last
+  // non-space character of the line and as the first non-space
+  // character of the next line; anything else cannot join.
+  {
+    let a = line.length - 1;
+    while (a >= 0 && (line[a] === " " || line[a] === "\t")) a--;
+    let b = 0;
+    while (b < next.length && (next[b] === " " || next[b] === "\t")) b++;
+    if (a < 0 || b >= next.length || !/[A-Za-z]/.test(line[a]) || !/[A-Za-z]/.test(next[b])) return null;
+  }
   const tail = /([A-Za-z]+)\s*$/.exec(line);
   const head = /^([A-Za-z]+)/.exec(next.replace(/^\s+/, ""));
   if (!tail || !head) return null;
@@ -1436,8 +1718,10 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
   const isProse = PROSE_EXTENSIONS.has(extname(label).toLowerCase()) || label === "<text>" || !extname(label);
   let inFence = false;
 
+  const findingKeys = new Set<string>();
   const push = (line: number, rule: string, severity: Severity, src: string, detail: string) => {
     findings.push({ file: label, line, rule, severity, excerpt: excerpt(src), detail });
+    findingKeys.add(`${rule}:${line}`);
   };
 
   /* HTML comments are scanned as a unit (P-010). A comment spanning lines
@@ -1492,6 +1776,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       let exfil: ReturnType<typeof matchExfil> = null;
       let construction: string | null = null;
       let paramExfil: ReturnType<typeof matchParameterExfil> = null;
+      let frontier: FrontierHit | null = null;
       let lure: ReturnType<typeof matchToolLure> = null;
       for (const body of variants) {
         instr = instr ?? matchInstructionLanguage(body);
@@ -1499,6 +1784,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         if (!exfil && rawExfil && rawExfil.severity !== "low") exfil = rawExfil;
         construction = construction ?? matchExfilConstruction(body);
         paramExfil = paramExfil ?? matchParameterExfil(body);
+        frontier = frontier ?? matchFrontier(body);
         const bodyLure = matchToolLure(body);
         if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
       }
@@ -1527,6 +1813,12 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         }
       } else if (!instr && lure) {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
+      }
+      if (frontier) {
+        push(start, frontier.rule, "high", raw, `${frontier.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
+        if (!instr && !exfil && !construction && !paramExfil && !lure) {
+          push(start, "html-comment-instruction", "high", raw, "HTML comment contains a frontier-channel payload; comments are invisible in rendered output but read by agents");
+        }
       }
       if (decodedHit && !exfil && !construction && !paramExfil) {
         push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth ${MAX_DECODE_DEPTH})`);
@@ -1610,7 +1902,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // construction (cat of a credential file, or an environment dump,
     // combined with an encoder or a network sink) on the same line.
     if (!commented) {
-      let exfil = matchExfil(line);
+      let exfil = matchExfil(line, normLines[i]);
       // P-095, wrapped form: the noun phrase is split by the line
       // wrap itself ("...no environment" at the end of one line,
       // "dump filtered for credential words..." at the start of the
@@ -1669,9 +1961,9 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
 
     // instruction-phrase (skip lines already claimed by the comment pass
     // to keep one finding per locus per rule family)
-    const instr = commented ? null : matchInstructionLanguageAt(line);
+    const instr = commented ? null : matchInstructionLanguageAt(line, normLines[i]);
     if (instr) {
-      const instrN = matchInstructionLanguageAt(normLines[i]);
+      const instrN = matchInstructionLanguageAt(normLines[i], normLines[i]);
       const inRaw = wholeLineQuoted || inSpan(instr.index);
       const inNorm = wholeLineQuotedN || (instrN !== null && inSpanN(instrN.index));
       const framedHit = (quoteCtx.framed && inRaw) || (quoteCtxN.framed && inNorm) || (narrativeSeg() && (inRaw || inNorm));
@@ -1695,7 +1987,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       // sees the line with a split sink token rejoined, and the
       // stronger of the two grades wins.
       const splitJoin = i + 1 < lines.length ? splitToolJoin(line, lines[i + 1]) : null;
-      let lure = matchToolLureAt(line);
+      let lure = matchToolLureAt(line, normLines[i]);
       if (splitJoin) {
         const joinedLure = matchToolLureAt(splitJoin.first + splitJoin.second);
         if (joinedLure && (!lure || SEVERITY_RANK[joinedLure.severity] > SEVERITY_RANK[lure.severity])) lure = joinedLure;
@@ -1743,7 +2035,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // body and reported any blob at the comment's first line; when a
     // newline after the opener put the blob on its own line, this
     // pass counted the same payload a second time.
-    if (!commented && !findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
+    if (!commented && !findingKeys.has(`base64-blob:${lineNo}`)) {
       const blobSources = [line, decodeEntities(line)];
       let blobPushed = false;
       for (const src of blobSources) {
@@ -1902,9 +2194,14 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     for (const cl of cleanedLines) { offsets.push(acc); acc += cl.length + 1; }
   }
   const lineAt = (idx: number): number => {
+    // P-080: binary search over line offsets (was a linear scan
+    // from the top for every flattened-pass hit).
+    let lo = 0;
+    let hi = offsets.length - 1;
     let ln = 1;
-    for (let i = 0; i < offsets.length; i++) {
-      if (offsets[i] <= idx) ln = i + 1; else break;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] <= idx) { ln = mid + 1; lo = mid + 1; } else { hi = mid - 1; }
     }
     return ln;
   };
@@ -2091,6 +2388,51 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
           doc ? "low" : "high",
           lines[startLine - 1],
           `Parameter-channel exfil pattern (${param.detail}) detected across lines${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  // Frontier channels (P-100 to P-103): render-channel exfiltration,
+  // behavior hijack, one-time-code theft, and the destructive
+  // instruction set are document-level combinations like the
+  // parameter channel, matched on the flattened text. Documentation
+  // grading follows the construction pass.
+  {
+    // The raw joined view runs first: leet normalization rewrites
+    // the at sign inside an email address token, which would erase
+    // the concrete third-party address Branch 3 of P-101 keys on.
+    // It is only built when the document contains an at sign at
+    // all; without one the raw view can add nothing.
+    const rawFlat = text.includes("@") ? lines.join(" ") : null;
+    const rawOffsets: number[] = [];
+    if (rawFlat !== null) {
+      let acc = 0;
+      for (const l of lines) { rawOffsets.push(acc); acc += l.length + 1; }
+    }
+    const rawLineAt = (idx: number): number => {
+      let lo = 0;
+      let hi = rawOffsets.length - 1;
+      let ln = 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (rawOffsets[mid] <= idx) { ln = mid + 1; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      return ln;
+    };
+    const frontierRaw = rawFlat !== null ? matchFrontier(rawFlat) : null;
+    const frontier = frontierRaw ?? matchFrontier(flat);
+    if (frontier) {
+      const startLine = frontierRaw ? rawLineAt(Math.max(0, frontier.index)) : lineAt(Math.max(0, frontier.index));
+      const already = findings.some((f) => f.rule === frontier.rule && f.detail.includes(frontier.detail.slice(0, 30)));
+      if (!already) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
+        push(
+          startLine,
+          frontier.rule,
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `${frontier.detail} detected across lines${doc ? ", in documentation context" : ""}`,
         );
       }
     }
@@ -2311,7 +2653,17 @@ export function stripEmphasisForMatching(s: string): string {
   return out;
 }
 
+const INVISIBLE_CHARS_RE = /[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/u;
+
 function composeNormalized(line: string, leet: boolean): string {
+  // P-080 identity fast path: a plain ASCII line with no invisible
+  // characters, no entity ampersand, no emphasis underscore, and no
+  // letter token carrying a leet digit is already its own
+  // normalization; every stage below is a no-op on it.
+  if (!INVISIBLE_CHARS_RE.test(line) && !line.includes("&") && !line.includes("_") && !/[^\x00-\x7f]/.test(line) &&
+    !(leet && /[A-Za-z][013457@$]|[013457@$][A-Za-z]/.test(line))) {
+    return line;
+  }
   const stripped = line.replace(/[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu, "");
   // Decode HTML entities (&#105;gnore, including the omitted-semicolon
   // forms, P-052) and homoglyphs (Cyrillic а) so the phrase matchers

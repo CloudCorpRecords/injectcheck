@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.1.13 (2026-10-22)
+
+Frontier design pass (Fix Pass 2): the four payload families the
+text-at-scale hunts found no pattern for, plus the large-file
+performance fix. 75 new tests (71 in test/frontier.test.ts from the
+verbatim W9 to W21 probe fixtures in all five layouts, 4 in
+test/p080.test.ts); 363 tests passing in total. Design note:
+~/workspace/security-wave/injectcheck-frontier-design.md in the
+program workspace.
+
+- P-100 render-channel exfiltration: an encode signal plus a
+  render or include construction plus a credential or private-data
+  noun, or a hidden container carrying private data into a rendered
+  link or markdown image, now grades exfil-pattern at high (W16,
+  W18, W20, W21 caught in all five layouts). One sub-shape is a
+  documented limit: a bare link whose URL carries a secret-named
+  parameter with only a word-substitution instruction (W14) has no
+  encode or render construction and is not detected; the README
+  limits section states the boundary.
+- P-101 behavior hijack: suppression plus user-data movement to a
+  third-party destination (W11), credential-class table contents
+  transferred into a new message (W12), and recipient-field
+  substitution naming a concrete third-party address (W10) now
+  grade exfil-pattern at high in all layouts. Pure tool shadowing
+  in the abstract, with no concrete destination, data movement, or
+  suppression, is a documented limit in the README.
+- P-102 one-time-code theft: a one-time or verification code noun
+  plus reading the code from the mailbox plus posting it outward
+  grades exfil-pattern at high (W19 in all layouts). Spoiler and
+  details regions are concealed text and are scanned at full
+  strength, never skipped.
+- P-103 destructive instruction set: agent-goal framing plus
+  destructive verbs over at least two estate-scale targets plus a
+  persistence or scope marker grades instruction-phrase at high
+  (W13 in all layouts). Bare fenced CLI commands with no goal
+  framing stay documentation.
+- P-080 large-file performance: the segment and context machinery
+  is precomputed and memoized per document (segment boundaries by
+  recurrence, per-segment evidence and narration facts, fence state,
+  framed-quotation and structural-context memoization), per-line
+  matchers reuse the precomputed normalized line, and exact fast
+  paths gate the URL-query views, base64 token runs, entity
+  decoding, and plain-ASCII normalization. Measured in file mode:
+  the benign 20 MB shape went from 18.2 s (0.1.12) to under 10 s,
+  and a hit-heavy file with no paragraph breaks went from 160 s at
+  1 MB (and a timeout at 5 MB) to about 4 s at 1 MB and about 15 s
+  at 5 MB, with identical verdicts.
+- Guardrails held exactly: the 550-text real corpus stays REVIEW
+  with 144 findings in 9 files, 0 high and 0 medium; the deepset
+  legitimate slice stays at 0 FINDINGS and the injection slice is
+  unchanged (22 FINDINGS, 9 REVIEW, 232 CLEAN); InjecAgent is
+  unchanged (base 1 FINDINGS of 62, enhanced 62 of 62, user
+  controls 17 of 17 CLEAN); W1 to W9 and W15 stay caught in all
+  layouts.
+
 ## 0.1.12 (2026-10-22)
 
 Fix release closing the grading-calibration bundle from the
