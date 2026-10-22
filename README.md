@@ -85,6 +85,18 @@ docker run -i ghcr.io/cloudcorprecords/injectcheck mcp
 docker run --rm -v "$PWD:/work" ghcr.io/cloudcorprecords/injectcheck scan /work
 ```
 
+## Evasion handling and known limits
+
+Attackers obfuscate. A second matching pass normalizes a copy of the text before matching: invisible characters are stripped, leetspeak inside words is decoded (ign0re becomes ignore), common Cyrillic and Greek homoglyphs are mapped to their Latin lookalikes, HTML entities are decoded, and lines are joined so phrases split across line breaks still match. Findings from this pass say so in their detail text. In a hardening battery of 12 evasion cases (split lines, mixed case, leetspeak, zero-width splits, homoglyphs, entity encoding, table cells, blockquotes, link titles, split exfil requests), 11 were caught.
+
+Honest limits, stated plainly:
+
+- Letter-spaced text ("i g n o r e   p r e v i o u s") is not caught. Collapsing single-letter spacing false-positives on initialisms and formatted text, so this stays a documented miss.
+- An instruction split across two separate HTML comments is only caught if one of the comments is itself incriminating; the join pass does not merge comment bodies.
+- Fenced code blocks are exempt from the prose rules by design. An injection written as a code sample will not fire the prose rules (hidden unicode still fires everywhere).
+- Base64 payloads are only flagged when the decoded text itself matches the instruction or exfil rules. A doubly encoded or encrypted payload is out of reach for a deterministic scanner.
+- This is a pattern scanner, not a proof of safety and not a semantic judge. Paraphrased instructions with no known phrase, verb, or noun will pass. CLEAN means no pattern matched, nothing more.
+
 ## The toolkit
 
 injectcheck is part of a family of small, single-purpose developer tools by the same author, all built the same way: one bin that serves a CLI and an MCP server, deterministic checks with evidence, no invented answers.

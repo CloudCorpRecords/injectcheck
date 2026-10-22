@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 export const RULES = [
   "hidden-unicode",
@@ -156,9 +156,11 @@ function matchExfil(line: string): { severity: Severity; detail: string } | null
   // not an instruction to the reader, and is reported at low (medium when
   // an agent is the grammatical subject doing the sending).
   const stripped = line.replace(/^[\s>*#|\-•]+/, "");
+  // Sentence-start imperatives only. A colon before the verb ("name: Publish
+  // to MCP Registry" in workflow YAML) is a key, not an imperative, and
+  // treating it as one false-positived on every publish workflow we own.
   const imperativeStart = new RegExp(`^${verb[0]}(?![\\w.-])`, "i").test(stripped) ||
-    new RegExp(`[.!?]\\s+${verb[0]}(?![\\w.-])`, "i").test(line) ||
-    new RegExp(`[:,;]\\s*(please\\s+)?${verb[0]}(?![\\w.-])`, "i").test(line);
+    new RegExp(`[.!?]\\s+${verb[0]}(?![\\w.-])`, "i").test(line);
   const pleaseMarker = /\b(please|you\s+must|you\s+should|make\s+sure\s+to|remember\s+to)\b/i.test(line.slice(0, noun.index + noun[0].length));
   const urlDestination = /\b(to|at|via|into)\s+https?:\/\//i.test(line);
   const directive = contentsOf || imperativeStart || pleaseMarker || urlDestination;
@@ -212,7 +214,9 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   { re: /\bcurl\b[^|\n]{0,200}?https?:\/\/[^\s|]+[^|\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, severity: "high", label: "curl piped to a shell" },
   { re: /\bwget\b[^|\n]{0,200}?https?:\/\/[^\s|]+[^|\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i, severity: "high", label: "wget piped to a shell" },
   { re: /\b(run|execute)\s+(this|the\s+following|that)\s+(shell\s+)?(command|script)\b/i, severity: "medium", label: "instruction to run a command" },
-  { re: /\b(run|execute)\s*:\s*[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
+  // "execute: true" is a config flag in MCP tool docs, not a command. The
+  // value after the colon must not be a bare boolean literal.
+  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
   { re: /\b(install|add)\s+this\s+(package|dependency|module)\s+and\s+(run|execute)\b/i, severity: "medium", label: "install a package and run it" },
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
@@ -355,7 +359,130 @@ export function scanText(text: string, label = "<text>"): Finding[] {
       }
     }
   }
+
+  /* Pass 2: flattened and normalized matching.
+   * Attackers split phrases across lines, hide them behind leetspeak, or
+   * break them with invisible characters. Normalize a copy of the whole
+   * text (strip invisible chars, decode leet inside words, join lines)
+   * and re-run the instruction and exfil matchers on it. Only matches
+   * that pass 1 missed (spanning lines, or visible only after
+   * normalization) are reported here, so nothing double-counts. */
+  const cleanedLines = lines.map((l) => normalizeForMatching(l));
+  const flat = cleanedLines.join(" ");
+  const offsets: number[] = [];
+  {
+    let acc = 0;
+    for (const cl of cleanedLines) { offsets.push(acc); acc += cl.length + 1; }
+  }
+  const lineAt = (idx: number): number => {
+    let ln = 1;
+    for (let i = 0; i < offsets.length; i++) {
+      if (offsets[i] <= idx) ln = i + 1; else break;
+    }
+    return ln;
+  };
+  const seenKeys = new Set(findings.map((f) => `${f.rule}:${f.line}`));
+
+  const phraseSets: Array<{ list: typeof STRONG_PHRASES; severity: Severity }> = [
+    { list: STRONG_PHRASES, severity: "high" },
+    { list: SOFT_PHRASES, severity: "medium" },
+  ];
+  for (const { list, severity } of phraseSets) {
+    for (const { re, label: phraseLabel } of list) {
+      const g = new RegExp(re.source, "gi");
+      let m: RegExpExecArray | null;
+      while ((m = g.exec(flat)) !== null) {
+        const startLine = lineAt(m.index);
+        const endLine = lineAt(m.index + m[0].length);
+        const spans = endLine > startLine;
+        const rawHit = matchInstructionLanguage(lines[startLine - 1]);
+        if (!spans && rawHit) continue; // pass 1 already reported this locus
+        const key = `instruction-phrase:${startLine}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        const doc = isQuotedDocContext(lines[startLine - 1]) || isQuotedDocContext(lines[endLine - 1]);
+        push(
+          startLine,
+          "instruction-phrase",
+          doc ? "low" : severity,
+          lines[startLine - 1],
+          `Instruction phrase (${phraseLabel}) detected ${spans ? `split across lines ${startLine}-${endLine}` : "after normalization (leetspeak or invisible characters)"}${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  // Exfil across lines or visible only after normalization.
+  {
+    const nounPositions: Array<{ index: number; text: string }> = [];
+    const nounRe = new RegExp(EXFIL_NOUN.source, "gi");
+    let nm: RegExpExecArray | null;
+    while ((nm = nounRe.exec(flat)) !== null) nounPositions.push({ index: nm.index, text: nm[0] });
+    const verbRe = new RegExp(EXFIL_VERB.source, "gi");
+    let vm: RegExpExecArray | null;
+    while ((vm = verbRe.exec(flat)) !== null) {
+      const noun = nounPositions.find((n) => Math.abs(n.index - vm!.index) <= 80);
+      if (!noun) continue;
+      const startLine = lineAt(Math.min(vm.index, noun.index));
+      const endLine = lineAt(Math.max(vm.index, noun.index));
+      const spans = endLine > startLine;
+      const rawHit = matchExfil(lines[startLine - 1]);
+      if (!spans && rawHit) continue;
+      const key = `exfil-pattern:${startLine}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      const window = flat.slice(Math.max(0, vm.index - 30), Math.min(flat.length, noun.index + noun.text.length + 30));
+      const hit = matchExfil(window);
+      // Cross-line exfil is only reported at directive strength. Legit code
+      // and workflow YAML pair POST/publish verbs with token nouns across
+      // lines constantly; narrative-strength cross-line matches are noise.
+      if (!hit || hit.severity !== "high") continue;
+      const doc = isDocContext(lines[startLine - 1]) || isDocContext(lines[endLine - 1]);
+      push(
+        startLine,
+        "exfil-pattern",
+        doc ? "low" : "high",
+        lines[startLine - 1],
+        `Exfil verb "${vm[0]}" near credential noun "${noun.text}" detected ${spans ? `split across lines ${startLine}-${endLine}` : "after normalization (leetspeak or invisible characters)"}${doc ? ", in documentation context" : ""}`,
+      );
+    }
+  }
+
   return findings;
+}
+
+/**
+ * Normalize a line for the pass-2 matchers: strip invisible characters
+ * (zero-width, bidi, tags, variation selectors) and decode leetspeak
+ * substitutions inside words that contain letters (ign0re -> ignore).
+ * Version strings and pure numbers are left alone.
+ */
+const LEET_MAP: Record<string, string> = {
+  "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s",
+};
+
+/** Cyrillic and Greek letters that render identically to Latin ones. */
+const HOMOGLYPH_MAP: Record<string, string> = {
+  "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c",
+  "\u0445": "x", "\u0443": "y", "\u0456": "i", "\u0458": "j", "\u04bb": "h",
+  "\u03b1": "a", "\u03b5": "e", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
+  "\u03c7": "x", "\u03c5": "u",
+};
+
+export function normalizeForMatching(line: string): string {
+  const stripped = line.replace(/[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu, "");
+  // Decode HTML entities (&#105;gnore) and homoglyphs (Cyrillic а) so the
+  // phrase matchers see the text a renderer or a tokenizer would show.
+  const decoded = stripped
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ");
+  const latin = decoded.replace(/[\u0430\u0435\u043e\u0440\u0441\u0445\u0443\u0456\u0458\u04bb\u03b1\u03b5\u03bf\u03c1\u03c4\u03c7\u03c5]/g, (c) => HOMOGLYPH_MAP[c] ?? c);
+  return latin.replace(/[A-Za-z0-9@$]+/g, (tok) => {
+    if (!/[A-Za-z]/.test(tok) || !/[013457@$]/.test(tok)) return tok;
+    return tok.replace(/[013457@$]/g, (c) => LEET_MAP[c] ?? c);
+  });
 }
 
 /* ------------------------------------------------------------------ */
