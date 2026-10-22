@@ -40,7 +40,12 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 /** A directory of finding-bearing files whose JSON report exceeds 200 KiB. */
 function writeBigTarget(root: string): void {
-  for (let i = 0; i < 160; i++) {
+  // 200 files (was 160): injectcheck v0.1.12 (P-089) deduplicates the
+  // flattened construction finding against the comment pass finding
+  // for the same comment span, so each payload file now yields 4
+  // findings instead of 5 and the human render needs more files to
+  // exceed the 200 KiB this suite exists to push through a pipe.
+  for (let i = 0; i < 200; i++) {
     writeFileSync(join(root, `issue-${String(i).padStart(3, "0")}.md`), PAYLOAD_FILE, "utf8");
   }
 }

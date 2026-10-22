@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.1.12 (2026-10-22)
+
+Fix release closing the grading-calibration bundle from the
+overnight flywheel hunts (Hunt Swarm 2 mutation, Hunt Swarm 5
+cross-dogfood, Hunt Swarm 3 text at scale): P-085, P-086, P-089,
+P-093, P-094, P-095, P-098, and the cosmetic P-105. Every fix
+landed test-first: 34 new tests in test/p085bundle.test.ts, 19
+failing on the 0.1.11 code for the ledger reasons and 15 controls
+passing before and after. 288 tests passing in total. One
+pre-existing test was updated in place: the pipe suite's fixture
+grew from 160 to 200 payload files, because the P-089 span dedup
+below removes one duplicate finding per payload file and the
+human render needs more files to exceed the 200 KiB the suite
+pushes through a pipe.
+
+- P-085: zero-width insertion into benign text let the
+  hidden-unicode density signal dominate the verdict (225
+  mutation runs, 35 flips to FINDINGS). Distributed invisible
+  characters now grade low however many a line holds; high
+  requires a cluster of five or more consecutive invisible
+  characters or an encoding density, and hidden-unicode mediums
+  alone never reach FINDINGS without a second signal family.
+  Payloads actually hidden with zero-width characters keep
+  FINDINGS through their payload rules, and tag or bidi
+  characters still grade high on their own.
+- P-086: case, spacing, and zero-width transforms on
+  documentation-shaped text eroded the attribution cues, so
+  quoted payloads graded at full severity (70 runs, all REVIEW
+  to FINDINGS). Attribution, documentation, and structural cues
+  are now matched on a normalized cue view of the framing text,
+  and payload hits are aligned with quotation spans on the
+  payload-normalized view, so the transforms cannot misalign a
+  hit with the span that frames it. The cue view does not decode
+  entities or leet: a cue must be visible as a cue. Adversarial
+  controls hold: bare payloads under fake headings and quotes
+  behind neutral lead-ins stay FINDINGS.
+- P-089: a newline after an HTML comment opener doubled some
+  findings, and the indented BOM-only mutant graded REVIEW
+  against a CLEAN baseline. Findings are now deduplicated by
+  comment span across the comment, per-line, split-blob, joined-
+  blob, and flattened passes, so identical content reports
+  identical counts; an indented byte order mark at the start of
+  a file is still a byte order mark. One honest count change
+  follows: multi-line comment payloads lose the flattened
+  construction duplicate the comment pass already reported (the
+  W2 shape now reports 2 highs instead of 3, verdict FINDINGS
+  unchanged; the W9 comment-multi layout reports 2 instead of
+  3, all five layouts still FINDINGS).
+- P-093: declarative AI-security prose ("AI output is sanitized
+  with DOMPurify...") drew an instruction-phrase medium as an
+  imperative addressed to an AI. The pattern now requires an
+  imperative shape: a verb after an AI mention followed by a
+  copula, a comma, a closing bracket, or a past-tense verb is a
+  noun in a declarative sentence, not an imperative.
+- P-094: the tool-lure medium fired on the literal token run:
+  in prose and headings. The run-colon lure now requires a
+  command-shaped value (a known command word, a script path, or
+  a script file), so a YAML key token quoted in prose and a
+  model name, version, or date after "Latest run:" do not fire,
+  while "run: curl ..." and "run: npm ..." still do.
+- P-095: narrative prose quotation still defeated
+  documentation-context grading (5 highs on the wave's own
+  docs). Attribution now extends to narrative quotation: report
+  section labels tolerate the long parenthetical of a ledger
+  evidence line, a payload inside a quotation or code span in a
+  segment that narrates the quotation (reporting verbs, variant
+  lists in running text, evidence lines) grades low, and the
+  noun phrase "environment dump" wrapped across a line break no
+  longer pairs as an exfil verb. The wave's own ledger,
+  SUMMARY, and fix and hunt reports now grade with no high and
+  no medium findings. Adversarial controls hold: an
+  unattributed bare payload paragraph in a report-shaped
+  document stays FINDINGS.
+- P-098: the three long-form agent incident reports in the
+  550-text corpus each drew one medium. The P-093 imperative
+  shape clears the two instruction-phrase mediums (a returned
+  assistant run, an assistant-output noun phrase), and refusal
+  narration about running a script no longer matches the
+  run-a-command lure when the refusal is narrated on the same
+  line. All three files now verdict CLEAN.
+- P-105 (cosmetic): the hidden-unicode detail for the exact
+  pattern @ + zero-width space + username now names the known
+  convention (GitHub release-note mentions in dependabot PR
+  bodies, a mention-ping suppression convention). No verdict
+  or severity change.
+- Real-text discipline on the 550-text corpus: the published
+  0.1.11 binary reports 148 findings in 12 files (0 high, 4
+  medium, 144 low); this release reports 144 findings in 9
+  files (0 high, 0 medium, 144 low), the four P-098 mediums
+  cleared, no new file flagged.
+
 ## 0.1.11 (2026-10-22)
 
 Fix release closing three injectcheck problems from the overnight

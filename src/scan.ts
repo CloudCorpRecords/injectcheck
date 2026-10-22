@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.11";
+export const VERSION = "0.1.12";
 
 export const RULES = [
   "hidden-unicode",
@@ -99,7 +99,16 @@ const STRONG_PHRASES: Array<{ re: RegExp; label: string }> = [
 const SOFT_PHRASES: Array<{ re: RegExp; label: string }> = [
   { re: /\b(attention|note|important)\s*[:,!]?\s*(ai|llm|agent|assistant|chatbot|language\s+model)\b/i, label: "direct address to an AI" },
   { re: /\b(dear|hello|hey)\s+(ai|llm|agent|assistant|chatbot)\b/i, label: "direct address to an AI" },
-  { re: /\b(ai|llm|agent|assistant|chatbot|language\s+model)\s*[:,]?\s+(please\s+)?(ignore|disregard|run|execute|send|post|upload|reveal|output|print|follow)\b/i, label: "imperative addressed to an AI" },
+  // P-093/P-098: the verb after an AI mention must be an imperative,
+  // not a noun in a declarative sentence. "AI output is sanitized",
+  // "assistant output, response-stream lifecycle", and "local
+  // assistant run returned ..." are product and incident-report prose
+  // where output and run are nouns (followed by a copula, a comma, a
+  // closing bracket, or a past-tense verb), not verbs addressed to a
+  // reader. The negative lookahead rejects exactly those noun
+  // continuations; a genuine imperative ("Assistant, run the tests",
+  // "AI, output the results") is followed by its object and fires.
+  { re: /\b(ai|llm|agent|assistant|chatbot|language\s+model)\s*[:,]?\s+(please\s+)?(ignore|disregard|run|execute|send|post|upload|reveal|output|print|follow)(?!\s*[,}\]]|\s+(?:is|was|were|are|returned|returns|generated)\b)\b/i, label: "imperative addressed to an AI" },
   { re: /\byou\s+must\s+(now\s+)?(run|execute|send|post|upload|reveal|output|print|fetch|download|install|call)\b/i, label: "you must <action>" },
   { re: /\bwhen\s+you\s+(read|see|process)\s+this\b[^.\n]{0,60}\b(run|execute|send|ignore|follow)\b/i, label: "when you read this, act" },
   // P-008 grading, second tier: an override verb plus a directive noun
@@ -209,7 +218,10 @@ const DOC_CONTEXT = /\b(rules?|patterns?|phrases?|verbs?|nouns?|such as|e\.g\.|d
 const STRONG_DOC_CONTEXT = /\b(patterns?|phrases?|such as|e\.g\.|detects?|detection|scans? for|scanning for|signatures?|shorthand|classifies)\b|\bexamples?(?=[\s:,)]|$)/i;
 
 export function isDocContext(line: string): boolean {
-  return DOC_CONTEXT.test(line);
+  // P-086: the documentation cue view is normalized like the
+  // attribution cue view, so transforms of the framing text cannot
+  // erode the cue while leaving the payload readable.
+  return DOC_CONTEXT.test(line) || DOC_CONTEXT.test(cueNormalize(line));
 }
 
 /**
@@ -218,7 +230,9 @@ export function isDocContext(line: string): boolean {
  * weaker marker appears alongside an actual quotation mark.
  */
 export function isQuotedDocContext(line: string): boolean {
-  return STRONG_DOC_CONTEXT.test(line) || (DOC_CONTEXT.test(line) && line.includes('"'));
+  if (STRONG_DOC_CONTEXT.test(line) || (DOC_CONTEXT.test(line) && line.includes('"'))) return true;
+  const cue = cueNormalize(line);
+  return STRONG_DOC_CONTEXT.test(cue) || (DOC_CONTEXT.test(cue) && cue.includes('"'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,8 +269,29 @@ const FRAMING_RE = /\b(the\s+following\s+(text|payload|message|prompt|instructio
  */
 export const EVIDENCE_LABEL_RE = /\b(evidence|output|quoted)\s+(excerpt|line|text|example)\s*:|\bquoted\s*:|\boutput\s+excerpt\b/i;
 
+/**
+ * P-086: the cue-matching view. Attribution and documentation cues
+ * are matched on this normalized view as well as on the raw text, so
+ * presentation transforms of the framing (zero-width insertion after
+ * spaces, homoglyph substitution, extra spacing, case) cannot erode
+ * the cues the way v0.1.10's payload normalization left them raw.
+ * The view deliberately does NOT decode HTML entities or leet: a cue
+ * must be visible as a cue to a human reader of the rendered text
+ * (case, spacing, and invisible-character transforms are), while an
+ * entity-encoded cue is a code layer, not framing a reader can see.
+ * The framing requirement itself is unchanged, so a bare payload
+ * with no narrating framing earns no downgrade on either view.
+ */
+export function cueNormalize(text: string): string {
+  const stripped = text.replace(/[\u200b-\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu, "");
+  const latin = stripped.replace(/[^\u0000-\u007f]/g, (c) => HOMOGLYPH_MAP[c] ?? c);
+  return latin.replace(/\s+/g, " ");
+}
+
 export function hasAttributionFraming(text: string): boolean {
-  return ATTRIBUTION_RE.test(text) || ATTRIBUTION_BY_RE.test(text) || FRAMING_RE.test(text) || EVIDENCE_LABEL_RE.test(text);
+  if (ATTRIBUTION_RE.test(text) || ATTRIBUTION_BY_RE.test(text) || FRAMING_RE.test(text) || EVIDENCE_LABEL_RE.test(text)) return true;
+  const cue = cueNormalize(text);
+  return cue !== text && (ATTRIBUTION_RE.test(cue) || ATTRIBUTION_BY_RE.test(cue) || FRAMING_RE.test(cue) || EVIDENCE_LABEL_RE.test(cue));
 }
 
 export interface QuotedSpan { start: number; end: number }
@@ -375,7 +410,7 @@ export function fenceLabelForContentLine(lines: string[], idx: number): number {
   return fenceLabelIndex(lines, open);
 }
 
-const REPORT_LABEL_RE = /^\s*[-*]?\s*(method|evidence|justification|judgement|judgment|finding|findings|verdict|summary)\b[^:\n]{0,40}:/i;
+const REPORT_LABEL_RE = /^\s*[-*]?\s*(method|evidence|justification|judgement|judgment|finding|findings|verdict|summary)\b[^:\n]{0,120}:/i;
 const FINDING_LISTING_RE = /^\s*[-*]?\s*(hidden-unicode|html-comment-instruction|instruction-phrase|exfil-pattern|tool-lure|base64-blob|alt-text-instruction)\s*,\s*(high|medium|low)\b/i;
 const FIX_NARRATION_RE = /\b(now\s+(fire|fires|fired|verdicts|scans|scanned|catches|caught|grades|graded)|does not fire|did not fire|no longer\s+(fire|fires|flags|verdicts))\b/i;
 const VERSION_HEADING_RE = /^\s*#{1,3}\s+\[?v?\d+\.\d+\.\d+/;
@@ -429,6 +464,27 @@ export function structuralContext(lines: string[], idx: number): StructuralConte
     return { framed: true, kind: "changelog or problem entry fix note" };
   }
   return { framed: false, kind: "" };
+}
+
+/**
+ * P-095: narrative quotation cues in the payload's own segment. The
+ * structural genres (labeled excerpts, finding listings, fix notes)
+ * do not cover a payload quoted mid-sentence in a report paragraph,
+ * a variant list in running text, or an evidence line in a ledger:
+ * those segments narrate what they quote (a reporting or quoting
+ * verb, a variant or phrase list, a family the report says now
+ * covers the quoted phrases, an evidence or excerpt mention). A
+ * payload inside a quotation or code span in such a segment is
+ * being exhibited by the narration. The span requirement is the
+ * guard: a bare payload paragraph in the same report carries no
+ * span and earns nothing from the segment's narration.
+ */
+const NARRATIVE_SEGMENT_RE = /\b(quot\w+|describ\w+|narrat\w+|report\w+|evidence|excerpt|justification|variants?|phrases?|listing|listed)\b|\bnow\s+(covers?|covered|includes?)\b|\bfamily\s+now\b/i;
+
+export function segmentNarrativeCue(lines: string[], idx: number): boolean {
+  const [start, end] = segmentRange(lines, idx);
+  const seg = lines.slice(start, end + 1).join(" ");
+  return NARRATIVE_SEGMENT_RE.test(seg) || NARRATIVE_SEGMENT_RE.test(cueNormalize(seg));
 }
 
 export interface QuoteContext { framed: boolean; spans: QuotedSpan[] }
@@ -487,6 +543,15 @@ function matchExfilRaw(line: string): { severity: Severity; detail: string } | n
   const verb = EXFIL_VERB.exec(line);
   const noun = EXFIL_NOUN.exec(line);
   if (!verb || !noun) return null;
+  // P-095: "environment dump" is a noun phrase, not a verb phrase. A
+  // report paragraph describing the shape ("no environment dump
+  // filtered for credential words..."), wrapped so the word dump
+  // lands at the start of a line, paired the noun dump with the
+  // noun credential and graded the description as a directive. The
+  // dump in that position is the object being described, not an
+  // action; the genuine environment-dump construction is matched
+  // separately by matchExfilConstruction and is untouched.
+  if (verb[0].toLowerCase() === "dump" && /\b(environment|env)\s+$/i.test(line.slice(0, verb.index))) return null;
   const distance = Math.abs(verb.index - noun.index);
   // Window: verb and noun within 80 chars, or the classic
   // "send the contents of X" shape anywhere on the line.
@@ -804,6 +869,8 @@ function matchHiddenUnicode(line: string): UnicodeHit | null {
   let bidi = 0;
   let tags = 0;
   let variation = 0;
+  // P-085: positions of counted invisible codepoints, for clustering.
+  const invisibleIdx: number[] = [];
   // P-013: severity scales with density and clustering. An invisible
   // character embedded inside a word (a letter or digit on both
   // sides) is concealment shaped: it splits a word a human reads as
@@ -838,12 +905,33 @@ function matchHiddenUnicode(line: string): UnicodeHit | null {
       if (cp === 0xfe0f && prev < 0x80 && !/[A-Za-z0-9]/.test(String.fromCodePoint(prev))) continue;
       variation++; counted = true;
     }
+    if (counted) invisibleIdx.push(k);
     if (counted && isAlnumCp(prev) && isAlnumCp(next)) embedded++;
   }
   if (tags > 0) return { kind: "unicode tag characters", severity: "high", count: tags };
   if (bidi > 0) return { kind: "bidi control characters", severity: "high", count: bidi };
   const invisible = zeroWidth + variation;
-  if (invisible >= 5) return { kind: "zero-width / variation-selector characters", severity: "high", count: invisible };
+  // P-085: a distributed density of invisible characters is formatting
+  // shaped (a zero-width space after every space, the mutation-hunt
+  // IC-Z shape) and must not by itself grade high: at mutation scale
+  // it carried benign text from CLEAN or REVIEW to FINDINGS on the
+  // density signal alone. High now requires a concealment shape: a
+  // cluster of 5 or more consecutive invisible characters (a run
+  // hidden in one spot), or an encoding density (invisible characters
+  // at least half as numerous as the visible non-space characters on
+  // the line, the zero-width steganography shape). Distributed
+  // characters embedded inside words still grade medium (the P-013
+  // concealment shape), and distributed isolated characters grade
+  // low however many a line holds.
+  let cluster = 0;
+  let run = 0;
+  for (let k = 0; k < invisibleIdx.length; k++) {
+    run = k > 0 && invisibleIdx[k] === invisibleIdx[k - 1] + 1 ? run + 1 : 1;
+    if (run > cluster) cluster = run;
+  }
+  const visibleNonSpace = cps.filter((cp) => cp > 0x20).length - invisible;
+  const encodingDensity = invisible >= 5 && visibleNonSpace > 0 && invisible / visibleNonSpace >= 0.5;
+  if (invisible >= 5 && (cluster >= 5 || encodingDensity)) return { kind: "zero-width / variation-selector characters", severity: "high", count: invisible };
   if (embedded >= 1) return { kind: "zero-width / variation-selector characters embedded in words", severity: "medium", count: invisible };
   if (invisible >= 1) return { kind: "zero-width / variation-selector characters", severity: "low", count: invisible };
   return null;
@@ -897,15 +985,36 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   // comments) and "Detector run: https://..." link labels; neither
   // instructs a reader to run anything, so a URL value is rejected too.
   // A command value ("run: curl https://...") still fires.
-  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b|the\b|https?:\/\/|www\.)[`'"]?[a-z]/i, severity: "medium", label: "instruction to run a command" },
+  // P-094: the value after run: must be command-shaped. A YAML key
+  // token quoted in prose ("run: line numbers", "the run: key"), a
+  // model name, version, or date in a heading ("## Latest run:
+  // qwen2.5:14b, Xod 0.6.1, 2026-10-15"), and changelog narration of
+  // workflow syntax are not lures; a genuine instruction names a
+  // command (a known command word, a script path, or a file with a
+  // script extension) after the colon.
+  { re: /\b(run|execute)\s*:\s*(?!true\b|false\b|yes\b|no\b|on\b|off\b|null\b|none\b|the\b|https?:\/\/|www\.)[`'"]?(?:(?:curl|wget|bash|sh|zsh|python3?|node|npm|npx|yarn|pnpm|pip3?|uv|sudo|cat|echo|printf|printenv|env|nc|ncat|chmod|chown|rm|mv|cp|mkdir|ls|git|gh|docker|kubectl|helm|make|eval|exec|source|export|base64|openssl|ssh|scp|rsync|tar|unzip|jq|sed|awk|grep|find|xargs|powershell|pwsh|cmd|deno|bun|go|cargo|java|mvn|gradle|terraform|ollama|systemctl|apt(?:-get)?|brew|kill|ps|touch|open|start)(?![\w-])|(?:\.\/|\/|~|\$)[\w./-]*|[\w./-]+\.(?:sh|bash|py|js|mjs|ps1)(?![\w-]))/i, severity: "medium", label: "instruction to run a command" },
   { re: /\b(install|add)\s+this\s+(package|dependency|module)\s+and\s+(run|execute)\b/i, severity: "medium", label: "install a package and run it" },
   { re: /\bpaste\s+this\s+into\s+your\s+(terminal|shell|console)\b/i, severity: "medium", label: "paste into terminal" },
 ];
 
+/**
+ * P-098: incident-report narration about a run request is not a lure.
+ * A report sentence that narrates a refusal ("user authorization to
+ * run that script, GPT-6 Astra max refused to invoke it") describes
+ * an agent declining to run something; the run-that-script phrase
+ * inside it is reported speech, not an instruction to this reader.
+ * Only the run-this/that-command pattern is suppressed, and only
+ * when a refusal or declination is narrated on the same line; every
+ * other lure shape on the line still fires.
+ */
+const NARRATIVE_REFUSAL_RE = /\b(refused|declined|refusal|would\s+not|did\s+not\s+(run|invoke|execute))\b/i;
+
 function matchToolLureRaw(line: string): { severity: Severity; label: string; index: number } | null {
   for (const lure of TOOL_LURES) {
     const m = lure.re.exec(line);
-    if (m) return { severity: lure.severity, label: lure.label, index: m.index };
+    if (!m) continue;
+    if (lure.label === "instruction to run a command" && /^(run|execute)\s+(this|the following|that)\b/i.test(m[0]) && NARRATIVE_REFUSAL_RE.test(line)) continue;
+    return { severity: lure.severity, label: lure.label, index: m.index };
   }
   return null;
 }
@@ -1311,8 +1420,19 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
   // as a hidden character and never adds a spurious hidden-unicode
   // finding to a file that merely carries one. A BOM anywhere else
   // in the text still counts like any other zero-width character.
-  const text = rawText.replace(/^\uFEFF/, "");
+  // P-089: an indented BOM (the IC-A mutant indents the whole file by
+  // four spaces) is still a byte order mark at the start of the
+  // content, not hidden content in a line of prose.
+  const text = rawText.replace(/^\uFEFF/, "").replace(/^([ \t]+)\uFEFF/, "$1");
   const lines = text.split(/\r?\n/);
+  // P-086: the payload-normalized view of every line, computed once.
+  // Context checks (quotation framing, structural attribution) run
+  // on this view as well as on the raw lines, with hit offsets and
+  // span positions taken from the same view, so a transform that
+  // shifts offsets in the raw text cannot misalign a payload hit
+  // with the quotation span that frames it. The flattened pass at
+  // the end of this function reuses this array as its cleaned lines.
+  const normLines = lines.map((l) => normalizeForMatching(l));
   const isProse = PROSE_EXTENSIONS.has(extname(label).toLowerCase()) || label === "<text>" || !extname(label);
   let inFence = false;
 
@@ -1428,7 +1548,18 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // hidden-unicode: anywhere, including code (that is the point of it)
     const uni = matchHiddenUnicode(line);
     if (uni) {
-      push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent`);
+      // P-105: the dependabot mention convention. GitHub release
+      // notes rendered into dependabot PR bodies write a mention as
+      // @ + zero-width space + username, the standard mention-ping
+      // suppression convention; it accounted for 139 of 151 findings
+      // on the 550-text real corpus. The finding and its severity
+      // are unchanged; the detail names the known convention so
+      // triage by finding count stops ranking the most ordinary
+      // texts in a corpus as its noisiest.
+      const mentionNote = /@[\u200b\u2060\ufeff][A-Za-z0-9][\w./-]*/.test(line)
+        ? "; this line matches the known convention for GitHub release-note mentions (@ + zero-width space + username, the mention-ping suppression convention in dependabot PR bodies); severity unchanged"
+        : "";
+      push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent${mentionNote}`);
     }
 
     if (inFence) continue; // remaining rules target prose, not code samples
@@ -1459,19 +1590,46 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // A framed line with no quoted spans is the blockquote shape: the
     // whole line is the quotation.
     const wholeLineQuoted = quoteCtx.framed && quoteCtx.spans.length === 0;
+    // P-086/P-095: the same context computed on the normalized view
+    // (normLines), where hit offsets and span positions share one
+    // coordinate system, plus the narrative segment cue (P-095). A
+    // payload hit counts as framed when it sits inside a span on a
+    // view whose framing holds, or inside any span on a line whose
+    // segment narrates the quotation.
+    const quoteCtxN = commented ? { framed: false, spans: [] as QuotedSpan[] } : framedQuotation(normLines, i);
+    const allSpansN = [...quoteCtxN.spans, ...codeSpans(normLines[i])];
+    const inSpanN = (pos: number): boolean => allSpansN.some((s) => pos >= s.start && pos < s.end);
+    const wholeLineQuotedN = quoteCtxN.framed && quoteCtxN.spans.length === 0;
+    // The narrative segment cue is computed lazily, only when a hit
+    // on this line needs it: segmentRange walks the whole segment,
+    // which on a document with no paragraph breaks is the document.
+    let narrativeSegCache: boolean | undefined;
+    const narrativeSeg = (): boolean => narrativeSegCache ??= !commented && (segmentNarrativeCue(lines, i) || segmentNarrativeCue(normLines, i));
 
     // exfil-pattern: the verb and noun pairing, plus the credential-read
     // construction (cat of a credential file, or an environment dump,
     // combined with an encoder or a network sink) on the same line.
     if (!commented) {
-      const exfil = matchExfil(line);
+      let exfil = matchExfil(line);
+      // P-095, wrapped form: the noun phrase is split by the line
+      // wrap itself ("...no environment" at the end of one line,
+      // "dump filtered for credential words..." at the start of the
+      // next), so the dump that opens the line is still the noun of
+      // the previous line's phrase, not a verb.
+      if (exfil && /Exfil verb "dump"/.test(exfil.detail) && /^\s*dump\b/i.test(line) && i > 0 && /\b(environment|env)\s*$/i.test(lines[i - 1].trim())) {
+        exfil = null;
+      }
       if (exfil) {
         let severity = exfil.severity;
         let detail = exfil.detail;
-        if (severity !== "low" && quoteCtx.framed) {
+        if (severity !== "low") {
           const verb = EXFIL_VERB.exec(line);
           const noun = EXFIL_NOUN.exec(line);
-          if (wholeLineQuoted || (verb && noun && inSpan(verb.index) && inSpan(noun.index))) {
+          const inRaw = wholeLineQuoted || (verb && noun && inSpan(verb.index) && inSpan(noun.index));
+          const verbN = EXFIL_VERB.exec(normLines[i]);
+          const nounN = EXFIL_NOUN.exec(normLines[i]);
+          const inNorm = wholeLineQuotedN || (verbN && nounN && inSpanN(verbN.index) && inSpanN(nounN.index));
+          if ((quoteCtx.framed && inRaw) || (quoteCtxN.framed && inNorm) || (narrativeSeg() && (inRaw || inNorm))) {
             severity = "low";
             detail = `Exfil pattern inside a payload quoted verbatim with attribution framing (described, not issued): ${exfil.detail}`;
           }
@@ -1487,14 +1645,20 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       if (construction && !(exfil && exfil.severity === "high")) {
         const anchor = constructionAnchor(line);
         const sctx = structuralContext(lines, i);
-        if (quoteCtx.framed && (wholeLineQuoted || (anchor >= 0 && inSpan(anchor)))) {
+        const sctxN = structuralContext(normLines, i);
+        const anchorN = constructionAnchor(normLines[i]);
+        const framedHere = (quoteCtx.framed && (wholeLineQuoted || (anchor >= 0 && inSpan(anchor)))) ||
+          (quoteCtxN.framed && (wholeLineQuotedN || (anchorN >= 0 && inSpanN(anchorN)))) ||
+          (narrativeSeg() && ((anchor >= 0 && inSpan(anchor)) || (anchorN >= 0 && inSpanN(anchorN))));
+        if (framedHere) {
           push(lineNo, "exfil-pattern", "low", line, `Exfil construction inside a payload quoted verbatim with attribution framing (described, not issued): ${construction}`);
-        } else if (sctx.framed) {
+        } else if (sctx.framed || sctxN.framed) {
+          const sctxEff = sctx.framed ? sctx : sctxN;
           // P-066: a construction described by a report or changelog
           // segment (a Method paragraph naming the payload core, a
           // fix note narrating the payload it fixed) is the segment's
           // subject, not an instruction to the reader.
-          push(lineNo, "exfil-pattern", "low", line, `Exfil construction described in a structurally attributed context (${sctx.kind}; described, not issued): ${construction}`);
+          push(lineNo, "exfil-pattern", "low", line, `Exfil construction described in a structurally attributed context (${sctxEff.kind}; described, not issued): ${construction}`);
         } else if (isDocContext(line)) {
           push(lineNo, "exfil-pattern", "low", line, `Exfil construction in documentation context (describing the pattern, not issuing it): ${construction}`);
         } else {
@@ -1507,11 +1671,15 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // to keep one finding per locus per rule family)
     const instr = commented ? null : matchInstructionLanguageAt(line);
     if (instr) {
-      if (quoteCtx.framed && (wholeLineQuoted || inSpan(instr.index))) {
+      const instrN = matchInstructionLanguageAt(normLines[i]);
+      const inRaw = wholeLineQuoted || inSpan(instr.index);
+      const inNorm = wholeLineQuotedN || (instrN !== null && inSpanN(instrN.index));
+      const framedHit = (quoteCtx.framed && inRaw) || (quoteCtxN.framed && inNorm) || (narrativeSeg() && (inRaw || inNorm));
+      if (framedHit) {
         // P-023: a verbatim quote with attribution framing is a payload
         // being described by security writing, not one being issued.
         push(lineNo, "instruction-phrase", "low", line, `Instruction phrase (${instr.label}) inside a payload quoted verbatim with attribution framing (described, not issued)`);
-      } else if (isQuotedDocContext(line)) {
+      } else if (isQuotedDocContext(line) || isQuotedDocContext(normLines[i])) {
         // Detector docs and security writeups quote these phrases to
         // describe them. Quoted-in-documentation is low, never blocking.
         push(lineNo, "instruction-phrase", "low", line, `Instruction phrase (${instr.label}) in documentation context (describing the pattern, not issuing it)`);
@@ -1540,6 +1708,15 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         // strength through the construction pass.
         if (lure.severity === "medium" && lure.label === "instruction to run a command" && benignCommandContext(lines, i)) {
           push(lineNo, "tool-lure", "low", line, `Tool lure in prose (${lure.label}), but the command in the following fence is benign human setup content (no exfil construction, no credential reference)`);
+        } else if (narrativeSeg() && (inSpan(lure.index) || inSpanN(matchToolLureAt(normLines[i])?.index ?? -1))) {
+          // P-095: a lure exhibited inside a quotation or backtick
+          // span in a segment that narrates the quotation
+          // (justification prose quoting a joined command string, a
+          // report line describing another document's finding) is
+          // the segment's subject, not a lure addressed to this
+          // reader. The span requirement is the guard, as in the
+          // structural branch below.
+          push(lineNo, "tool-lure", "low", line, `Tool lure in prose (${lure.label}), but exhibited inside a quoted span in a narrative report segment (described, not issued)`);
         } else if (structuralContext(lines, i).framed && (inSpan(lure.index) || structuralContext(lines, i).kind !== "changelog or problem entry fix note")) {
           // P-066: a lure exhibited as evidence in a report segment
           // (inside a quoted or backtick span after an evidence label,
@@ -1561,7 +1738,12 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // can wrap an entity layer which wraps the payload), and the line
     // is also scanned after entity decoding, so an entity-encoded blob
     // is visible to the blob matcher.
-    if (!findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
+    // P-089: a line inside an HTML comment is not re-scanned for
+    // blobs here. The comment pass already decoded the whole comment
+    // body and reported any blob at the comment's first line; when a
+    // newline after the opener put the blob on its own line, this
+    // pass counted the same payload a second time.
+    if (!commented && !findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
       const blobSources = [line, decodeEntities(line)];
       let blobPushed = false;
       for (const src of blobSources) {
@@ -1591,6 +1773,19 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     }
   }
 
+  // P-089: dedup against the comment pass by span. Several passes
+  // below can re-derive a finding the comment pass already reported
+  // for the same payload span (a newline after the comment opener
+  // moves the payload lines off the comment's first line, where the
+  // older line-keyed dedup looked). A candidate whose line sits in
+  // a comment span that already carries a finding of the same rule
+  // is the same payload counted twice, whatever line it anchors on.
+  const spanOfLine = (ln: number) => commentSpans.find((s) => ln >= s.start && ln <= s.end);
+  const alreadyInSpan = (rule: string, ln: number): boolean => {
+    const span = spanOfLine(ln);
+    return span !== undefined && findings.some((f) => f.rule === rule && f.line >= span.start && f.line <= span.end);
+  };
+
   /* Split base64 (P-026): a blob wrapped across lines with a markdown
    * hard break defeats per-line blob matching. Runs of consecutive
    * base64-looking lines are joined, decoded, and re-scanned; the
@@ -1604,7 +1799,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         const joined = runParts.join("");
         if (joined.length >= 60 && joined.length <= MAX_BLOB_CHARS) {
           const lineNo = runStart + 1;
-          if (!findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
+          if (!findings.some((f) => f.rule === "base64-blob" && f.line === lineNo) && !alreadyInSpan("base64-blob", lineNo)) {
             const decoded = decodeBase64(joined);
             if (decoded) {
               let hitLabel = scanFragmentForPayload(decoded);
@@ -1648,6 +1843,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     for (const { joined, index } of joinedBlobRuns(text)) {
       const lineNo = text.slice(0, index).split("\n").length;
       if (findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) continue;
+      if (alreadyInSpan("base64-blob", lineNo)) continue;
       const decoded = decodeBase64(joined);
       if (!decoded) continue;
       let hitLabel = scanFragmentForPayload(decoded);
@@ -1671,7 +1867,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
    * and re-run the instruction and exfil matchers on it. Only matches
    * that pass 1 missed (spanning lines, or visible only after
    * normalization) are reported here, so nothing double-counts. */
-  const cleanedLines = lines.map((l) => normalizeForMatching(l));
+  const cleanedLines = normLines;
   // P-053: rejoin a tool token split across a line break before the
   // flattened matchers run. The head fragment moves to the end of the
   // earlier line and the later line keeps its remainder, so line
@@ -1744,7 +1940,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         // addressed to an AI. Only a real directive shape survives: an
         // explicit agent address or a second-person imperative.
         if (ADDRESS_LABELS.has(phraseLabel) && isAiAuthorshipText(lines[startLine - 1])) continue;
-        const doc = isQuotedDocContext(lines[startLine - 1]) || isQuotedDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+        const doc = isQuotedDocContext(lines[startLine - 1]) || isQuotedDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed || segmentNarrativeCue(lines, startLine - 1);
         push(
           startLine,
           "instruction-phrase",
@@ -1834,7 +2030,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       // and workflow YAML pair POST/publish verbs with token nouns across
       // lines constantly; narrative-strength cross-line matches are noise.
       if (!hit || hit.severity !== "high") continue;
-      const doc = isDocContext(lines[startLine - 1]) || isDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+      const doc = isDocContext(lines[startLine - 1]) || isDocContext(lines[endLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
       push(
         startLine,
         "exfil-pattern",
@@ -1862,8 +2058,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       // at the same line (P-066 anchor fix exposed this on the P-024
       // fence-split shape, whose construction anchors on the exact
       // line the exfil pass had claimed and discarded).
-      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine)) {
-        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine) && !alreadyInSpan("exfil-pattern", startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
         push(
           startLine,
           "exfil-pattern",
@@ -1887,8 +2083,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     const param = matchParameterExfil(flat);
     if (param) {
       const startLine = lineAt(Math.max(0, param.index));
-      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine)) {
-        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine) && !alreadyInSpan("exfil-pattern", startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
         push(
           startLine,
           "exfil-pattern",
@@ -2223,6 +2419,14 @@ export function collectFiles(root: string, options: ScanOptions = {}, warnings?:
 export function computeVerdict(findings: Finding[]): Verdict {
   const high = findings.filter((f) => f.severity === "high").length;
   const medium = findings.filter((f) => f.severity === "medium").length;
+  // P-085: hidden-unicode findings alone never carry a text to
+  // FINDINGS at medium strength. Density from formatting (many lines
+  // of inside-word zero-width stuffing, each grading medium) needs
+  // corroboration from a second signal family to reach the top
+  // verdict; a hidden-unicode high (a cluster, an encoding density,
+  // tag or bidi characters) still verdicts FINDINGS on its own, and
+  // any medium from another rule family restores the usual count.
+  if (high === 0 && medium >= 3 && findings.every((f) => f.rule === "hidden-unicode")) return "REVIEW";
   if (high > 0 || medium >= 3) return "FINDINGS";
   if (findings.length > 0) return "REVIEW";
   return "CLEAN";
