@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.1.9 (2026-10-22)
+
+Fix release closing two injectcheck problems from the overnight
+flywheel: P-079 from the chaos hunt (CHAOS-05) and P-092 from the
+cross-dogfood hunt (CD-2). Every fix landed test-first: 24 new
+tests in test/p079p092.test.ts, 15 of which failed on 0.1.8 for
+exactly the ledger reasons before the fix (the rest are controls
+that passed before and after); 193 tests passing in total.
+
+- P-079: scan coverage caps were silent, and CLEAN was reported
+  over the unscanned remainder. A per-file size cap skipped files
+  with no warning (a directory whose only file was 2 MB scanned
+  zero files and verdicted CLEAN, and a 20 MB notes file with a
+  planted injection verdicted CLEAN in scan mode while file mode
+  found the planting), and a 5,000-file count cap truncated a
+  6,000-file tree at exactly 5,000 files, CLEAN, warnings empty.
+  Both caps are raised after measurement (size from 1 MiB to
+  5 MiB, count from 5,000 to 20,000: a roughly 3.5 MB file scans
+  in about a second and a 10,002-file tree traverses in seconds),
+  and at whatever bound is in force the scan is now honest: files
+  over the size cap, files beyond the count cap, binary files
+  with a text extension, and unreadable files are all reported
+  in warnings by name or count; the report carries filesSeen and
+  filesSkipped alongside filesScanned (and the human renderer
+  states the coverage when anything was skipped); and any
+  warning floors a CLEAN verdict at REVIEW, generalizing the
+  P-056 partial-scan floor, so a verdict computed over a
+  partially scanned estate is never an unqualified CLEAN.
+- P-092: the .json file channel was blind where scan_text was
+  not; identical bytes scored CLEAN via a .json file and FINDINGS
+  via scan_text, so payload text inside sibling tools' JSON
+  reports (hookcheck scans, actionpin audits) was laundered to
+  CLEAN or near-clean while their human renderings were caught.
+  A .json file whose bytes parse as JSON is now scanned through
+  its string content: every string literal is extracted in
+  source order with escapes decoded, keys as well as values, and
+  run through the same normalization and grading pipeline as
+  prose text, with finding lines mapped back to the string's
+  source line. Payload text in JSON string fields fires the same
+  rules at the same severities as in a text file; benign JSON
+  (package.json style config, numbers, booleans, nulls, short
+  strings) stays CLEAN; documentation-shaped string content
+  keeps the documentation grading of its text equivalent; and
+  malformed JSON does not crash, falling back to the raw text
+  scan. Extraction is bounded (200,000 strings or 8,000,000
+  decoded characters) and a truncation past the bound is warned
+  and floors the verdict, per the P-079 honesty rule.
+
+193 tests passing. Guardrails re-verified on the published
+binary: the cd2 corpus pair agrees at FINDINGS, a fresh
+hookcheck JSON report on the A1 fixture is no longer CLEAN,
+A5 still FINDINGS, A6 still controlled, the Wave D markdown
+set deterministic across 3 runs, and the injectcheck corpus
+section passing in full.
+
 ## 0.1.8 (2026-10-22)
 
 Fix release closing one injectcheck problem from the overnight

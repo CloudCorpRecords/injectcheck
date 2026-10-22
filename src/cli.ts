@@ -88,7 +88,8 @@ async function main(): Promise<void> {
         process.exitCode = 2;
         return;
       }
-      const report = makeReport(positional[0], 1, scanText(text, positional[0]));
+      const warnings: string[] = [];
+      const report = makeReport(positional[0], 1, scanText(text, positional[0], warnings), warnings, { filesSeen: 1, filesSkipped: 0 });
       await emit(asJson ? JSON.stringify(report, null, 2) : renderReport(report), report.verdict === "CLEAN" ? 0 : 1);
     } else {
       usage();

@@ -17,7 +17,8 @@ server.tool(
   },
   async ({ text, label }) => {
     const name = label ?? "<text>";
-    const report = makeReport(name, 1, scanText(text, name));
+    const warnings: string[] = [];
+    const report = makeReport(name, 1, scanText(text, name, warnings), warnings, { filesSeen: 1, filesSkipped: 0 });
     return { content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }] };
   },
 );

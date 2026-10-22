@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.8";
+export const VERSION = "0.1.9";
 
 export const RULES = [
   "hidden-unicode",
@@ -946,7 +946,7 @@ const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1 };
 /* Per-text scanning                                                   */
 /* ------------------------------------------------------------------ */
 
-export function scanText(rawText: string, label = "<text>"): Finding[] {
+function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
   const findings: Finding[] = [];
   // P-055: a leading byte order mark is an encoding signature, not
   // hidden content. Strip it before scanning so it is never counted
@@ -1409,6 +1409,166 @@ export function scanText(rawText: string, label = "<text>"): Finding[] {
   return findings;
 }
 
+/* ------------------------------------------------------------------ */
+/* JSON file channel (P-092)                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-092: the .json file channel was blind where scan_text was not.
+ * The raw bytes of a JSON report hold payload text inside string
+ * fields, but the raw layout defeats the text rules twice over: the
+ * prose gate kept tool-lure out of non-prose extensions, and the
+ * JSON punctuation around a string distorts the documentation and
+ * quotation context the grading depends on, so identical bytes
+ * scored CLEAN as a .json file and FINDINGS as raw text. Sibling
+ * tools hand their reports to agents as JSON, so the blind channel
+ * is exactly the machine-readable one.
+ *
+ * The fix: a file whose label ends in .json and whose bytes parse
+ * as JSON is scanned through its string content, not its raw
+ * layout. Every string literal in the document is extracted in
+ * source order, keys as well as values (keys are agent-read text
+ * too, and a payload in a key is the same payload; ordinary
+ * structural keys are short identifiers that no rule fires on),
+ * with JSON escapes decoded. The extracted strings are laid out
+ * one per source line position and run through the identical
+ * scanText pipeline as prose, so payload text inside JSON string
+ * fields fires the same rules at the same severities as the same
+ * text in a .txt file, and documentation-shaped string content
+ * keeps the documentation grading of its text equivalent. Finding
+ * lines map back to the line of the string literal in the JSON
+ * source. Numbers, booleans, and nulls carry no text and are not
+ * extracted.
+ *
+ * Malformed JSON does not crash and does not skip: parsing fails,
+ * extraction is skipped, and the raw bytes are scanned as text
+ * exactly as before this channel existed.
+ *
+ * The extractor is bounded: at most MAX_JSON_STRINGS string
+ * literals and MAX_JSON_EXTRACTED_CHARS decoded characters are
+ * extracted. Past the bound the remaining strings are not scanned;
+ * that truncation is reported through the caller's warnings array
+ * with the P-079 honesty treatment (a warning, and the report
+ * verdict floors at REVIEW), never silence.
+ */
+export const MAX_JSON_STRINGS = 200000;
+export const MAX_JSON_EXTRACTED_CHARS = 8000000;
+
+interface JsonStringToken { value: string; line: number }
+
+/** Decode one JSON string token starting at text[start] (a quote). */
+function readJsonString(text: string, start: number): { value: string; end: number } | null {
+  let i = start + 1;
+  let out = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') return { value: out, end: i + 1 };
+    if (ch === "\\") {
+      const esc = text[i + 1];
+      if (esc === "u") {
+        const hex = text.slice(i + 2, i + 6);
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+        out += String.fromCharCode(parseInt(hex, 16));
+        i += 6;
+        continue;
+      }
+      const simple: Record<string, string> = {
+        '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t",
+      };
+      if (esc in simple) {
+        out += simple[esc];
+        i += 2;
+        continue;
+      }
+      return null;
+    }
+    out += ch;
+    i++;
+  }
+  return null;
+}
+
+/** Every string literal in a JSON document, in source order. */
+export function extractJsonStrings(text: string): { tokens: JsonStringToken[]; truncated: boolean } {
+  const tokens: JsonStringToken[] = [];
+  let chars = 0;
+  let line = 1;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\n") { line++; i++; continue; }
+    if (ch !== '"') { i++; continue; }
+    const tok = readJsonString(text, i);
+    if (!tok) { i++; continue; }
+    if (tokens.length >= MAX_JSON_STRINGS || chars + tok.value.length > MAX_JSON_EXTRACTED_CHARS) {
+      return { tokens, truncated: true };
+    }
+    chars += tok.value.length;
+    tokens.push({ value: tok.value, line });
+    // A decoded escape sequence cannot contain a raw newline, so any
+    // newline inside the token span is a raw character of a (technically
+    // malformed but parse-tolerated) string; keep line numbers honest.
+    const rawSpan = text.slice(i, tok.end);
+    const newlines = rawSpan.match(/\n/g)?.length ?? 0;
+    line += newlines;
+    i = tok.end;
+  }
+  return { tokens, truncated: false };
+}
+
+/**
+ * Scan text for injection patterns. For a .json label whose content
+ * parses as JSON, the scan runs over the extracted string content
+ * (see the P-092 note above); findings carry the original label and
+ * the source line of the string they were found in. An optional
+ * warnings array receives the extraction truncation warning when
+ * the extractor bound is reached.
+ */
+export function scanText(rawText: string, label = "<text>", warnings?: string[]): Finding[] {
+  if (extname(label).toLowerCase() !== ".json") {
+    return scanTextInternal(rawText, label);
+  }
+  const text = rawText.replace(/^\uFEFF/, "");
+  try {
+    JSON.parse(text);
+  } catch {
+    // Malformed JSON: fall back to the raw scan, exactly the
+    // pre-P-092 behavior. No crash, no skip, no warning: the file
+    // was scanned, as text.
+    return scanTextInternal(rawText, label);
+  }
+  const { tokens, truncated } = extractJsonStrings(text);
+  if (truncated && warnings) {
+    warnings.push(
+      `JSON string extraction truncated in ${label}: the extractor bound ` +
+      `(${MAX_JSON_STRINGS} strings or ${MAX_JSON_EXTRACTED_CHARS} decoded characters) was reached; ` +
+      `the scan is partial and later string values were not scanned`,
+    );
+  }
+  // Lay the extracted strings out as a synthetic prose document.
+  // Each decoded line of a string becomes one synthetic line, mapped
+  // back to the source line the string starts on plus its offset
+  // inside the string. The synthetic document goes through the full
+  // pipeline (per-line rules, comments, flattened and normalized
+  // passes, recursive decoding), identical to a text file.
+  const syntheticLines: string[] = [];
+  const lineMap: number[] = [];
+  for (const tok of tokens) {
+    const parts = tok.value.split(/\r?\n/);
+    for (let k = 0; k < parts.length; k++) {
+      syntheticLines.push(parts[k]);
+      lineMap.push(tok.line + k);
+    }
+  }
+  const synthetic = syntheticLines.join("\n");
+  const inner = scanTextInternal(synthetic, "extracted-json.txt");
+  return inner.map((f) => ({
+    ...f,
+    file: label,
+    line: lineMap[f.line - 1] ?? f.line,
+  }));
+}
+
 /**
  * Normalize a line for the pass-2 matchers: strip invisible characters
  * (zero-width, bidi, tags, variation selectors) and decode leetspeak
@@ -1444,11 +1604,32 @@ export function normalizeForMatching(line: string): string {
 /* Path scanning                                                       */
 /* ------------------------------------------------------------------ */
 
-export function collectFiles(root: string, options: ScanOptions = {}, warnings?: string[]): string[] {
-  const maxFiles = options.maxFiles ?? 5000;
+/** Default coverage caps (P-079). Raised in v0.1.9 after measurement. */
+export const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
+export const DEFAULT_MAX_FILES = 20000;
+
+export interface CollectedFiles {
+  files: string[];
+  /** Candidate text files seen in the tree, collected or not. */
+  filesSeen: number;
+  /** Seen files left uncollected because the count cap was reached. */
+  filesSkipped: number;
+}
+
+/**
+ * Walk a tree collecting candidate text files. P-079: the walk no
+ * longer stops at the count cap. Every candidate is counted as seen,
+ * files beyond the cap are counted as skipped, and when any were
+ * skipped a warning states the cap and the skipped count; the
+ * verdict floor in makeReport then keeps the partial scan from
+ * presenting as an unqualified CLEAN.
+ */
+export function collectFilesDetailed(root: string, options: ScanOptions = {}, warnings?: string[]): CollectedFiles {
+  const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
   const out: string[] = [];
+  let seen = 0;
+  let skipped = 0;
   const walk = (dir: string): void => {
-    if (out.length >= maxFiles) return;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -1463,17 +1644,31 @@ export function collectFiles(root: string, options: ScanOptions = {}, warnings?:
       return;
     }
     for (const entry of entries) {
-      if (out.length >= maxFiles) return;
       const full = join(dir, entry.name);
       if (entry.isDirectory()) {
         if (!SKIP_DIRS.has(entry.name)) walk(full);
       } else if (entry.isFile() && TEXT_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-        out.push(full);
+        seen++;
+        if (out.length < maxFiles) {
+          out.push(full);
+        } else {
+          skipped++;
+        }
       }
     }
   };
   walk(root);
-  return out;
+  if (skipped > 0 && warnings) {
+    warnings.push(
+      `File count cap reached: ${seen} text files were seen but the scan cap is ${maxFiles}; ` +
+      `${skipped} file${skipped === 1 ? "" : "s"} beyond the cap were not scanned; the scan is partial`,
+    );
+  }
+  return { files: out, filesSeen: seen, filesSkipped: skipped };
+}
+
+export function collectFiles(root: string, options: ScanOptions = {}, warnings?: string[]): string[] {
+  return collectFilesDetailed(root, options, warnings).files;
 }
 
 export function computeVerdict(findings: Finding[]): Verdict {
@@ -1484,21 +1679,33 @@ export function computeVerdict(findings: Finding[]): Verdict {
   return "CLEAN";
 }
 
-export function makeReport(target: string, filesScanned: number, findings: Finding[], warnings: string[] = []): ScanReport {
+export function makeReport(
+  target: string,
+  filesScanned: number,
+  findings: Finding[],
+  warnings: string[] = [],
+  completeness: { filesSeen?: number; filesSkipped?: number } = {},
+): ScanReport {
   const counts: Record<Severity, number> = { high: 0, medium: 0, low: 0 };
   for (const f of findings) counts[f.severity]++;
-  // Partial scan floor (P-056, mirroring hookcheck P-049): when a file
-  // could not be read, the scan did not see the whole target, so a
-  // bare CLEAN is not an honest verdict. Floor at REVIEW; the warnings
-  // name exactly what was missed.
+  // Partial scan floor (P-056, mirroring hookcheck P-049; generalized
+  // by P-079): every warning this tool emits reports a part of the
+  // target the scan did not cover (an unreadable file or directory,
+  // a file over the size cap, files beyond the count cap, a binary
+  // file, a truncated JSON extraction). When any is present the scan
+  // did not see the whole target, so a bare CLEAN is not an honest
+  // verdict. Floor at REVIEW; the warnings name exactly what was
+  // missed.
   let verdict = computeVerdict(findings);
-  if (verdict === "CLEAN" && warnings.some((w) => w.startsWith("Unreadable"))) {
+  if (verdict === "CLEAN" && warnings.length > 0) {
     verdict = "REVIEW";
   }
   return {
     target,
     verdict,
     filesScanned,
+    filesSeen: completeness.filesSeen ?? filesScanned,
+    filesSkipped: completeness.filesSkipped ?? 0,
     findings,
     counts,
     warnings,
@@ -1507,7 +1714,7 @@ export function makeReport(target: string, filesScanned: number, findings: Findi
 }
 
 export function scanPath(target: string, options: ScanOptions = {}): ScanReport {
-  const maxBytes = options.maxFileBytes ?? 1024 * 1024;
+  const maxBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
   let stat;
   try {
     stat = statSync(target);
@@ -1516,40 +1723,64 @@ export function scanPath(target: string, options: ScanOptions = {}): ScanReport 
   }
   if (stat.isFile()) {
     const text = readFileSync(target, "utf8");
-    return makeReport(target, 1, scanText(text, target));
+    const warnings: string[] = [];
+    const findings = scanText(text, target, warnings);
+    return makeReport(target, 1, findings, warnings, { filesSeen: 1, filesSkipped: 0 });
   }
   if (!stat.isDirectory()) {
     throw new Error(`Path is neither a file nor a directory: ${target}`);
   }
   const warnings: string[] = [];
-  const files = collectFiles(target, options, warnings);
+  const collected = collectFilesDetailed(target, options, warnings);
   const findings: Finding[] = [];
   let scanned = 0;
-  for (const file of files) {
+  let skipped = collected.filesSkipped;
+  for (const file of collected.files) {
     try {
       const st = statSync(file);
-      if (st.size > maxBytes) continue;
+      if (st.size > maxBytes) {
+        // P-079: a file over the size cap is skipped, but the skip is
+        // reported by name, size, and cap (it used to be a silent
+        // continue, so a directory whose only file was over the cap
+        // verdicted CLEAN with filesScanned 0 and no warning).
+        skipped++;
+        warnings.push(`File skipped over the size cap: ${file} is ${st.size} bytes, over the per-file size cap of ${maxBytes} bytes; the scan is partial and this file was not scanned`);
+        continue;
+      }
       const text = readFileSync(file, "utf8");
-      if (text.includes("\0")) continue; // binary content with a text extension
+      if (text.includes("\0")) {
+        // Binary content with a text extension: skipped, and now
+        // reported like every other skip (P-079) instead of silently.
+        skipped++;
+        warnings.push(`Binary file skipped: ${file} contains NUL bytes and is not text; the scan is partial and this file was not scanned`);
+        continue;
+      }
       scanned++;
-      findings.push(...scanText(text, file));
+      findings.push(...scanText(text, file, warnings));
     } catch (err) {
       // P-056: an unreadable file is skipped (never guessed at), but
       // the skip is reported by name and reason, in JSON and human
       // output, and the verdict floor in makeReport keeps a partial
       // scan from presenting as an unqualified CLEAN.
+      skipped++;
       const code = (err as NodeJS.ErrnoException).code ?? "unreadable";
       warnings.push(`Unreadable file skipped: ${file} could not be read (${code}); the scan is partial and this file was not scanned`);
     }
   }
-  return makeReport(target, scanned, findings, warnings);
+  return makeReport(target, scanned, findings, warnings, {
+    filesSeen: collected.filesSeen,
+    filesSkipped: skipped,
+  });
 }
 
 export function renderReport(report: ScanReport): string {
   const lines: string[] = [];
+  const coverage = report.filesSkipped > 0 || report.filesSeen !== report.filesScanned
+    ? `${report.filesScanned} of ${report.filesSeen} file${report.filesSeen === 1 ? "" : "s"} scanned, ${report.filesSkipped} skipped, `
+    : `${report.filesScanned} file${report.filesScanned === 1 ? "" : "s"} scanned, `;
   lines.push(
     `injectcheck ${report.target}: ${report.verdict} ` +
-    `(${report.filesScanned} file${report.filesScanned === 1 ? "" : "s"} scanned, ` +
+    `(${coverage}` +
     `${report.findings.length} finding${report.findings.length === 1 ? "" : "s"}: ` +
     `${report.counts.high} high, ${report.counts.medium} medium, ${report.counts.low} low)`,
   );
