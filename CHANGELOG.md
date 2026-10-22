@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.1.5 (2026-10-22)
+
+Fix release closing the injectcheck problems from the overnight
+flywheel Wave A (evasion expansion) and Wave B (real-repo corpus
+expansion) hunts, ledger P-024 to P-030 and P-037 to P-039 in the
+Security Wave validation program. Every fix landed test-first: 23 new
+tests failed on 0.1.4 for exactly the ledger reasons before the fix.
+
+- P-024 (BLOCKER): a payload split across a code fence boundary scored
+  CLEAN. The exfil construction now also recognizes a credential file
+  read performed by curl or wget (not only cat), and the document-level
+  pass joins prose and fence content, so the composed instruction,
+  command in the fence, and collector URL in prose after it grade as
+  one exfil construction at high.
+- P-025: nested HTML comments hid a complete payload. Comment spans
+  are now balanced: the scanner reads the raw span from the first
+  opener to the last closer of a nested run.
+- P-026: encoding stacks and split base64 defeated all decoding.
+  Decoding is now bounded and recursive (HTML entities and base64
+  composed to depth 3), applied inside comments and to decoded layers,
+  and base64 split across lines with a markdown hard break is joined
+  before decoding.
+- P-027: a payload percent-encoded into a badge URL query string was
+  not decoded or scanned. URL query values on image and link targets
+  are percent-decoded and scanned like alt text.
+- P-028: payloads split across markdown structures were under-graded.
+  The flattened document pass assembles table rows into the exfil
+  construction, and footnote or reference definitions carrying an
+  imperative (or any run-this-command shape) grade at directive
+  strength instead of narrative low.
+- P-029: zero-width characters inside key words blinded the payload
+  rules entirely. The comment pass and the flattened pass now match on
+  zero-width-stripped text for every payload rule, not only for the
+  density count.
+- P-030: a payload addressed to a named agent framework (Claude Code
+  by name) graded low as narrative. A named agent address followed by
+  an imperative is a direct-address signal at medium, and it makes an
+  accompanying exfil pairing directive.
+- P-038: hidden-unicode counted grapheme-internal codepoints as hidden
+  characters. A variation selector completing an emoji (including the
+  dangling selector left in markdown anchors), a joiner inside an
+  emoji ZWJ sequence, and joiners flanked by joining-script letters
+  (Persian ZWNJ) are no longer counted. Genuine zero-width stuffing
+  still fires, including the sparse P-013 shape.
+- P-039: tool-lure fired at medium on human setup prose whose benign
+  command sat in the following fence (npm install, npm run dev, a
+  localhost curl). That shape now grades low, with the fence content
+  checked first: a fence holding an exfil construction, a credential
+  reference, or an environment dump filtered for credential words is
+  never benign, so the P-024 tension holds.
+- P-037: with P-038 and P-039 fixed, the real continuedev/continue
+  CONTRIBUTING.md no longer verdicts FINDINGS (REVIEW, lows only).
+- Guardrail repair found during verification: a payload quoted in a
+  blockquote with verb-before-subject attribution ("Quoted example
+  reported by researcher...") briefly graded high through the new
+  construction shape. Attribution framing now also recognizes the
+  reported-by form and quoted-example framing, and the per-line
+  construction pass honors documentation context like the other
+  passes. The Wave A quoted-payload control is a regression test.
+
+122 tests passing. Guardrails re-verified on the published binary:
+A5 FINDINGS with all rule families, A6 control REVIEW with lows only,
+wild payloads W1 to W8 all FINDINGS, the Wave B ordinary-text set
+(65 texts) at 0 FINDINGS and 0 high findings, and the Wave A controls
+unchanged.
+
 ## 0.1.4 (2026-10-22)
 
 Fix release closing the three injectcheck problems from Round 2

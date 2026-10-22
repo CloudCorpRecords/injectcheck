@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.4";
+export const VERSION = "0.1.5";
 
 export const RULES = [
   "hidden-unicode",
@@ -100,6 +100,11 @@ const SOFT_PHRASES: Array<{ re: RegExp; label: string }> = [
   // It is worth a human look, but on its own it is also how people write
   // about their own task lists, so it never reaches high alone.
   { re: /\b(ignore|disregard|forget|override)\s+((?:about|all|the|your|any)\s+){0,3}(instructions?|orders?|tasks?|assignments?|commands?)\b/i, label: "override of instructions, orders, or tasks (no temporal marker)" },
+  // P-030: an imperative addressed to a named agent framework (Claude
+  // Code, Cursor, Copilot, and similar) is a direct-address signal, not
+  // narrative. A bare mention or an authorship disclosure does not match:
+  // the name must be followed by an imperative or a should-do directive.
+  { re: /\b(claude\s+code|cursor|copilot|chatgpt|codex|gemini\s+cli|aider|cline|windsurf|devin)\b\s*(agents?\s+)?[:,]?\s+(please\s+)?(stop\b|run\b|execute\b|send\b|post\b|upload\b|ignore\b|disregard\b|follow\b|do\s+not\b|before\s+reading\b|should\s+(do|run|execute|send)\b)/i, label: "imperative addressed to a named agent framework" },
 ];
 
 /**
@@ -210,10 +215,11 @@ export function isQuotedDocContext(line: string): boolean {
 const ATTRIBUTION_SUBJECT = "(?:attackers?|researchers?|authors?|maintainers?|analysts?|write-?up|advisory|report|article|paper|blog|study|team)";
 const ATTRIBUTION_VERB = "(?:planted|wrote|written|said|says|quoted|quotes|quoting|reported|found|observed|discovered|documented|contains|reads?|stated|states|noted|warned|warns|posted|left|added|included|injected|embedded)";
 const ATTRIBUTION_RE = new RegExp(`\\b${ATTRIBUTION_SUBJECT}\\b[^"']{0,100}?\\b${ATTRIBUTION_VERB}\\b`, "i");
-const FRAMING_RE = /\b(the\s+following\s+(text|payload|message|prompt|instructions?|content|comment)|quoted\s+(below|above|verbatim|here)|verbatim\s+(quote|text|payload)|example\s+(payload|prompt|injection)|sample\s+payload)\b/i;
+const ATTRIBUTION_BY_RE = new RegExp(`\\b${ATTRIBUTION_VERB}\\b[^"']{0,40}?\\bby\\b[^"']{0,40}?\\b${ATTRIBUTION_SUBJECT}\\b`, "i");
+const FRAMING_RE = /\b(the\s+following\s+(text|payload|message|prompt|instructions?|content|comment)|quoted\s+(below|above|verbatim|here|example)|verbatim\s+(quote|text|payload)|example\s+(payload|prompt|injection)|sample\s+payload)\b/i;
 
 export function hasAttributionFraming(text: string): boolean {
-  return ATTRIBUTION_RE.test(text) || FRAMING_RE.test(text);
+  return ATTRIBUTION_RE.test(text) || ATTRIBUTION_BY_RE.test(text) || FRAMING_RE.test(text);
 }
 
 export interface QuotedSpan { start: number; end: number }
@@ -297,7 +303,19 @@ function matchExfil(line: string): { severity: Severity; detail: string } | null
     new RegExp(`[.!?]\\s+${verb[0]}(?![\\w.-])`, "i").test(line);
   const pleaseMarker = /\b(please|you\s+must|you\s+should|make\s+sure\s+to|remember\s+to)\b/i.test(line.slice(0, noun.index + noun[0].length));
   const urlDestination = /\b(to|at|via|into)\s+https?:\/\//i.test(line);
-  const directive = contentsOf || imperativeStart || pleaseMarker || urlDestination;
+  // P-028: a run-this-command imperative anywhere on the line is a
+  // directive shape, including inside a footnote or reference definition
+  // (the footnote in the Wave A corpus opened with exactly this shape and
+  // was graded narrative low). Footnote and reference definitions render
+  // at the foot of a page but an agent reads them at full strength, so a
+  // definition line carrying any imperative verb is directive too.
+  const runCommandDirective = /\b(run|execute)\s+(this|the\s+following|that)\s+(command|script|step|verification\s+step)\b/i.test(line);
+  const isDefinition = /^\s*\[\^[^\]]+\]:/.test(line) || /^\s*\[[^\]]+\]:\s/.test(line);
+  const definitionDirective = isDefinition && /\b(run|execute|send|post|upload|do\s+not|stop)\b/i.test(line);
+  // P-030: a named agent framework addressed on the line makes an
+  // accompanying exfil verb and noun a directive, not a description.
+  const namedAgentDirective = /\b(claude\s+code|cursor|copilot|chatgpt|codex|gemini\s+cli|aider|cline|windsurf|devin)\b/i.test(line) && /\b(run|execute|send|post|upload|stop|do\s+not)\b/i.test(line);
+  const directive = contentsOf || imperativeStart || pleaseMarker || urlDestination || runCommandDirective || definitionDirective || namedAgentDirective;
   if (directive) {
     return {
       severity: "high",
@@ -321,7 +339,7 @@ function matchExfil(line: string): { severity: Severity; detail: string } | null
  * no encoder and no sink does not fire: reading a key file is also what
  * legitimate setup docs describe.
  */
-const CRED_READ = /\bcat\b[\s\S]{0,160}?(~\/\.ssh\/[\w.\-]+|id_rsa\b|\.aws\/credentials\b|\.aws\/[\w.\-]+|\.env\b|\.npmrc\b)/i;
+const CRED_READ = /\b(?:cat|curl|wget)\b[\s\S]{0,160}?(~\/\.ssh\/[\w.\-]+|id_rsa\b|\.aws\/credentials\b|\.aws\/[\w.\-]+|\.env\b|\.npmrc\b)/i;
 const ENV_DUMP = /\bprintenv\b|\benv\s*\|/i;
 const ENCODE_SINK = /\|\s*(base64|xxd|gzip|od)\b/i;
 const NET_SINK = /\b(?:nc|ncat)\s+(?:-[a-z]+\s+)*[\w.\-]+\s+\d{2,5}\b|\b(?:curl|wget)\b[\s\S]{0,200}?https?:\/\//i;
@@ -339,23 +357,72 @@ export function matchExfilConstruction(text: string): string | null {
   return null;
 }
 
+/** Offset of the read that anchors an exfil construction in a fragment. */
+export function constructionAnchor(text: string): number {
+  const flat = text.replace(/\s+/g, " ");
+  const cred = CRED_READ.exec(flat);
+  if (cred) return cred.index;
+  const dump = ENV_DUMP.exec(flat);
+  return dump ? dump.index : -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Hidden unicode                                                      */
 /* ------------------------------------------------------------------ */
 
 interface UnicodeHit { kind: string; severity: Severity; count: number }
 
+/**
+ * P-038: not every zero-width or variation-selector codepoint is hidden
+ * content. U+FE0F is part of the emoji it follows (the heart, the shield,
+ * the recycle symbol), U+200D is the joiner inside emoji ZWJ sequences
+ * (the technologist is person plus ZWJ plus laptop), and U+200C/U+200D
+ * flanked by letters of a joining script are required orthography
+ * (Persian ZWNJ). Those codepoints are excluded, with context. Genuine
+ * stuffing still counts: a zero-width space anywhere, a variation
+ * selector after an ordinary letter, a joiner inside a Latin word.
+ */
+function isEmojiCapable(cp: number): boolean {
+  return cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf) || (cp >= 0x2b00 && cp <= 0x2bff) ||
+    (cp >= 0x2100 && cp <= 0x214f) || cp === 0x203c || cp === 0x2049 || cp === 0x3030 || cp === 0x303d ||
+    cp === 0x3297 || cp === 0x3299 || (cp >= 0x1f3fb && cp <= 0x1f3ff);
+}
+function isJoiningScript(cp: number): boolean {
+  return (cp >= 0x0590 && cp <= 0x05ff) || (cp >= 0x0600 && cp <= 0x06ff) ||
+    (cp >= 0x0750 && cp <= 0x077f) || (cp >= 0x08a0 && cp <= 0x08ff) ||
+    (cp >= 0x0900 && cp <= 0x097f) || (cp >= 0xfb50 && cp <= 0xfdff) ||
+    (cp >= 0xfe70 && cp <= 0xfeff);
+}
+
 function matchHiddenUnicode(line: string): UnicodeHit | null {
   let zeroWidth = 0;
   let bidi = 0;
   let tags = 0;
   let variation = 0;
-  for (const ch of line) {
-    const cp = ch.codePointAt(0)!;
-    if (cp === 0x200b || cp === 0x200c || cp === 0x200d || cp === 0x2060 || cp === 0xfeff) zeroWidth++;
+  const cps = [...line].map((ch) => ch.codePointAt(0)!);
+  for (let k = 0; k < cps.length; k++) {
+    const cp = cps[k];
+    const prev = k > 0 ? cps[k - 1] : 0;
+    const next = k + 1 < cps.length ? cps[k + 1] : 0;
+    if (cp === 0x200b || cp === 0x2060 || cp === 0xfeff) zeroWidth++;
+    else if (cp === 0x200c || cp === 0x200d) {
+      // Joiner inside an emoji sequence, or joiner/non-joiner flanked by
+      // joining-script letters, is grapheme construction, not hiding.
+      if (isEmojiCapable(prev) || isEmojiCapable(next)) continue;
+      if (isJoiningScript(prev) && isJoiningScript(next)) continue;
+      zeroWidth++;
+    }
     else if ((cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069)) bidi++;
     else if (cp >= 0xe0000 && cp <= 0xe007f) tags++;
-    else if ((cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0xe0100 && cp <= 0xe01ef)) variation++;
+    else if ((cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0xe0100 && cp <= 0xe01ef)) {
+      if (cp === 0xfe0f && isEmojiCapable(prev)) continue; // VS16 completing an emoji
+      // A VS16 after ASCII punctuation is presentation debris (the
+      // dangling selector left in a markdown anchor when the emoji base
+      // is stripped, "#<VS16>-ways-to-contribute"), not stuffing: hidden
+      // variation selectors hide inside words, after letters or digits.
+      if (cp === 0xfe0f && prev < 0x80 && !/[A-Za-z0-9]/.test(String.fromCodePoint(prev))) continue;
+      variation++;
+    }
   }
   if (tags > 0) return { kind: "unicode tag characters", severity: "high", count: tags };
   if (bidi > 0) return { kind: "bidi control characters", severity: "high", count: bidi };
@@ -443,6 +510,70 @@ function decodeBase64(blob: string): string | null {
 }
 
 /* ------------------------------------------------------------------ */
+/* Bounded recursive decoding (P-026)                                  */
+/* ------------------------------------------------------------------ */
+
+/** Decode numeric and common named HTML entities in a fragment. */
+export function decodeEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ");
+}
+
+/**
+ * Scan a decoded or normalized fragment for payload evidence: an
+ * instruction phrase, a directive exfil pairing, or an exfil
+ * construction. Returns a short label for the strongest hit, or null.
+ */
+export function scanFragmentForPayload(t: string): string | null {
+  const instr = matchInstructionLanguage(t);
+  if (instr) return `instruction phrase (${instr.label})`;
+  const construction = matchExfilConstruction(t);
+  if (construction) return `exfil construction (${construction})`;
+  const exfil = matchExfil(t);
+  if (exfil && exfil.severity === "high") return "exfil pattern";
+  return null;
+}
+
+/**
+ * All texts reachable from a fragment by bounded decoding: entity
+ * decoding and base64 decoding of embedded blobs, composed recursively
+ * to depth 3 (entity layer, base64 layer, entity layer covers the
+ * observed stacks). Static analysis only; decoded text is scanned,
+ * never executed.
+ */
+export function recursiveDecodeCandidates(text: string, maxDepth = 3): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>([text]);
+  let frontier: Array<{ s: string; depth: number }> = [{ s: text, depth: 0 }];
+  while (frontier.length > 0) {
+    const next: Array<{ s: string; depth: number }> = [];
+    for (const { s, depth } of frontier) {
+      if (depth >= maxDepth) continue;
+      const variants: string[] = [];
+      const ent = decodeEntities(s);
+      if (ent !== s) variants.push(ent);
+      const blobRe = /[A-Za-z0-9+/]{40,}={0,2}/g;
+      let bm: RegExpExecArray | null;
+      while ((bm = blobRe.exec(s)) !== null) {
+        const decoded = decodeBase64(bm[0]);
+        if (decoded) variants.push(decoded);
+      }
+      for (const v of variants) {
+        if (seen.has(v)) continue;
+        seen.add(v);
+        out.push(v);
+        next.push({ s: v, depth: depth + 1 });
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* Alt text / link titles                                              */
 /* ------------------------------------------------------------------ */
 
@@ -460,6 +591,77 @@ function matchAltText(line: string): { severity: Severity; label: string; fragme
     if (hit) return { ...hit, fragment: link[0] };
   }
   return null;
+}
+
+/**
+ * P-027: payloads percent-encoded into a link or image URL query string.
+ * Alt text is scanned, so query values on the same targets are scanned
+ * too: percent-decode each value (and the whole query), then run the
+ * payload matchers on the decoded text.
+ */
+function matchUrlQuery(line: string): { label: string; fragment: string } | null {
+  const urlRe = /\]\((https?:\/\/[^)\s]+)\)|<(https?:\/\/[^>\s]+)>|\b(https?:\/\/[^\s)"'<>]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = urlRe.exec(line)) !== null) {
+    const url = m[1] ?? m[2] ?? m[3];
+    if (!url || !url.includes("?")) continue;
+    const query = url.slice(url.indexOf("?") + 1);
+    const pieces = [query, ...query.split("&").map((kv) => kv.includes("=") ? kv.slice(kv.indexOf("=") + 1) : kv)];
+    for (const piece of pieces) {
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(piece.replace(/\+/g, " "));
+      } catch {
+        decoded = piece.replace(/%([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+      }
+      if (decoded === piece) continue;
+      const hit = scanFragmentForPayload(decoded);
+      if (hit) return { label: hit, fragment: m[0] };
+    }
+  }
+  return null;
+}
+
+/**
+ * P-039 context check: a run-the-following-command sentence whose actual
+ * command sits in an immediately following code fence (or an inline code
+ * span on a following line) and is benign: no exfil construction, no
+ * credential noun, no instruction language in the command itself. The
+ * distinguishing signal is the absence of an exfil construction, per the
+ * Wave A evidence; P-024 fence-adjacent exfil content is graded by the
+ * construction pass and never reaches this downgrade, because a fence
+ * holding a construction is not benign here.
+ */
+export function benignCommandContext(lines: string[], idx: number): boolean {
+  let content: string | null = null;
+  for (let j = idx + 1; j < Math.min(lines.length, idx + 4); j++) {
+    const l = lines[j];
+    if (/^\s*(```|~~~)/.test(l)) {
+      const body: string[] = [];
+      for (let k = j + 1; k < Math.min(lines.length, j + 21); k++) {
+        if (/^\s*(```|~~~)/.test(lines[k])) break;
+        body.push(lines[k]);
+      }
+      content = body.join("\n");
+      break;
+    }
+    const inline = /`([^`\n]{3,})`/.exec(l);
+    if (inline) { content = inline[1]; break; }
+    if (l.trim() === "") continue;
+    break;
+  }
+  if (content === null || content.trim() === "") return false;
+  if (matchExfilConstruction(content)) return false;
+  // A credential reference (a credential file path, key material, or a
+  // secret assignment) in the command defeats benign. A bare noun like
+  // the word "Tokens:" in output formatting does not: the Wave B ollama
+  // repro fence prints a token count from a localhost response.
+  if (/(~\/\.ssh|id_rsa|\.aws\/|\.env\b|\.npmrc|api[\s_-]?keys?|private\s+keys?|passwords?\s*[=:]|secrets?\s*[=:]|auth\s+tokens?)/i.test(content)) return false;
+  // An environment dump filtered for credential words is the W3 lure
+  // shape even before a sink appears; never benign.
+  if (ENV_DUMP.test(content) && /(key|token|secret|pass)/i.test(content)) return false;
+  if (matchInstructionLanguage(content)) return false;
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -485,29 +687,81 @@ export function scanText(text: string, label = "<text>"): Finding[] {
    * rules below: one comment yields one finding per rule family. */
   const commentSpans: Array<{ start: number; end: number }> = [];
   {
-    const commentRe = /<!--([\s\S]*?)-->/g;
-    let cm: RegExpExecArray | null;
-    while ((cm = commentRe.exec(text)) !== null) {
-      const start = text.slice(0, cm.index).split("\n").length;
-      const end = start + (cm[0].match(/\n/g)?.length ?? 0);
+    // P-025: comments are scanned over the raw span from the first opener
+    // to the last closer of a nested run. A non-greedy match to the first
+    // closer blinds the scanner to content an agent still ingests when a
+    // second opener appears inside the first comment, so openers and
+    // closers are balanced: depth only returns to zero at the final
+    // closer of the run.
+    interface RawSpan { from: number; to: number; body: string }
+    const rawSpans: RawSpan[] = [];
+    {
+      const tokenRe = /<!--|-->/g;
+      let tm: RegExpExecArray | null;
+      let depth = 0;
+      let spanFrom = -1;
+      while ((tm = tokenRe.exec(text)) !== null) {
+        if (tm[0] === "<!--") {
+          if (depth === 0) spanFrom = tm.index;
+          depth++;
+        } else if (depth > 0) {
+          depth--;
+          if (depth === 0 && spanFrom >= 0) {
+            rawSpans.push({ from: spanFrom, to: tm.index + 3, body: text.slice(spanFrom + 4, tm.index) });
+            spanFrom = -1;
+          }
+        }
+      }
+      if (spanFrom >= 0) {
+        rawSpans.push({ from: spanFrom, to: text.length, body: text.slice(spanFrom + 4) });
+      }
+    }
+    for (const span of rawSpans) {
+      const start = text.slice(0, span.from).split("\n").length;
+      const end = start + (text.slice(span.from, span.to).match(/\n/g)?.length ?? 0);
       commentSpans.push({ start, end });
-      const body = cm[1].replace(/\\\r?\n/g, " ").replace(/\s+/g, " ").trim();
-      const instr = matchInstructionLanguage(body);
-      const rawExfil = matchExfil(body);
-      const exfil = rawExfil && rawExfil.severity !== "low" ? rawExfil : null;
-      const construction = matchExfilConstruction(body);
+      const raw = text.slice(span.from, span.to);
+      // P-029: zero-width characters are stripped before the payload
+      // rules run (normalizeForMatching), not only counted by the
+      // density rule, so stuffing inside key words cannot blind them.
+      const variants = [span.body, normalizeForMatching(span.body)]
+        .map((b) => b.replace(/\\\r?\n/g, " ").replace(/\s+/g, " ").trim());
+      let instr: ReturnType<typeof matchInstructionLanguage> = null;
+      let exfil: ReturnType<typeof matchExfil> = null;
+      let construction: string | null = null;
+      let lure: ReturnType<typeof matchToolLure> = null;
+      for (const body of variants) {
+        instr = instr ?? matchInstructionLanguage(body);
+        const rawExfil = matchExfil(body);
+        if (!exfil && rawExfil && rawExfil.severity !== "low") exfil = rawExfil;
+        construction = construction ?? matchExfilConstruction(body);
+        lure = lure ?? matchToolLure(body);
+      }
+      // P-026: bounded recursive decoding of the comment body (entity
+      // layers and base64 layers composed to depth 3).
+      let decodedHit: string | null = null;
+      for (const body of variants) {
+        for (const candidate of recursiveDecodeCandidates(body)) {
+          decodedHit = scanFragmentForPayload(candidate.replace(/\s+/g, " ").trim());
+          if (decodedHit) break;
+        }
+        if (decodedHit) break;
+      }
       if (instr) {
-        push(start, "html-comment-instruction", "high", cm[0], `HTML comment contains instruction language (${instr.label}); comments are invisible in rendered output but read by agents`);
+        push(start, "html-comment-instruction", "high", raw, `HTML comment contains instruction language (${instr.label}); comments are invisible in rendered output but read by agents`);
       }
       if (exfil || construction) {
-        push(start, "exfil-pattern", "high", cm[0], `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction}`);
+        push(start, "exfil-pattern", "high", raw, `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction}`);
         if (!instr) {
-          push(start, "html-comment-instruction", "high", cm[0], "HTML comment contains an exfil pattern; comments are invisible in rendered output but read by agents");
+          push(start, "html-comment-instruction", "high", raw, "HTML comment contains an exfil pattern; comments are invisible in rendered output but read by agents");
         }
-      } else if (!instr) {
-        const lure = matchToolLure(body);
-        if (lure) {
-          push(start, "html-comment-instruction", "high", cm[0], `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
+      } else if (!instr && lure) {
+        push(start, "html-comment-instruction", "high", raw, `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
+      }
+      if (decodedHit && !exfil && !construction) {
+        push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth 3)`);
+        if (!instr) {
+          push(start, "html-comment-instruction", "high", raw, "HTML comment contains encoded instruction content; comments are invisible in rendered output but read by agents");
         }
       }
     }
@@ -536,6 +790,10 @@ export function scanText(text: string, label = "<text>"): Finding[] {
     if (isProse && !commented) {
       const alt = matchAltText(line);
       if (alt) push(lineNo, "alt-text-instruction", alt.severity, alt.fragment, `Instruction language in image alt text or link title (${alt.label}); alt text is read by agents, rarely by humans`);
+      // P-027: percent-encoded payloads in URL query strings on image
+      // and link targets, decoded and scanned like alt text.
+      const uq = matchUrlQuery(line);
+      if (uq) push(lineNo, "alt-text-instruction", "high", uq.fragment, `Instruction language in a URL query string (${uq.label}) after percent-decoding; URL query values are read by agents, rarely inspected by humans`);
     }
 
     // Attributed-quotation context for this line (P-023): payload text
@@ -567,9 +825,11 @@ export function scanText(text: string, label = "<text>"): Finding[] {
       }
       const construction = matchExfilConstruction(line);
       if (construction && !(exfil && exfil.severity === "high")) {
-        const anchor = line.search(/\bcat\b|\bprintenv\b|\benv\s*\|/i);
+        const anchor = constructionAnchor(line);
         if (quoteCtx.framed && (wholeLineQuoted || (anchor >= 0 && inSpan(anchor)))) {
           push(lineNo, "exfil-pattern", "low", line, `Exfil construction inside a payload quoted verbatim with attribution framing (described, not issued): ${construction}`);
+        } else if (isDocContext(line)) {
+          push(lineNo, "exfil-pattern", "low", line, `Exfil construction in documentation context (describing the pattern, not issuing it): ${construction}`);
         } else {
           push(lineNo, "exfil-pattern", "high", line, `Exfil construction: ${construction}`);
         }
@@ -598,23 +858,98 @@ export function scanText(text: string, label = "<text>"): Finding[] {
     if (isProse && !commented) {
       const lure = matchToolLure(line);
       if (lure) {
-        push(lineNo, "tool-lure", lure.severity, line, `Tool lure in prose (${lure.label}); commands belong in code, not in text an agent is told to obey`);
+        // P-039: human setup prose whose command sits in the following
+        // fence and is benign (install, dev server, localhost repro)
+        // grades low, not medium. A fence holding an exfil construction
+        // is not benign, so fence-split payloads (P-024) keep full
+        // strength through the construction pass.
+        if (lure.severity === "medium" && lure.label === "instruction to run a command" && benignCommandContext(lines, i)) {
+          push(lineNo, "tool-lure", "low", line, `Tool lure in prose (${lure.label}), but the command in the following fence is benign human setup content (no exfil construction, no credential reference)`);
+        } else {
+          push(lineNo, "tool-lure", lure.severity, line, `Tool lure in prose (${lure.label}); commands belong in code, not in text an agent is told to obey`);
+        }
       }
     }
 
-    // base64-blob: decode and re-scan the decoded text
-    BASE64_RE.lastIndex = 0;
-    let bm: RegExpExecArray | null;
-    while ((bm = BASE64_RE.exec(line)) !== null) {
-      const blob = bm[0];
-      if (blob.length > MAX_BLOB_CHARS) continue;
-      const decoded = decodeBase64(blob);
-      if (!decoded) continue;
-      const hit = matchInstructionLanguage(decoded) ?? (matchExfil(decoded) ? { severity: "high" as Severity, label: "exfil pattern" } : null);
-      if (hit) {
-        push(lineNo, "base64-blob", "high", blob, `Base64 blob (${blob.length} chars) decodes to instruction-like text (${hit.label}): "${excerpt(decoded)}"`);
+    // base64-blob: decode and re-scan the decoded text. P-026: the
+    // decoded layer is itself re-scanned recursively (a base64 layer
+    // can wrap an entity layer which wraps the payload), and the line
+    // is also scanned after entity decoding, so an entity-encoded blob
+    // is visible to the blob matcher.
+    if (!findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
+      const blobSources = [line, decodeEntities(line)];
+      let blobPushed = false;
+      for (const src of blobSources) {
+        if (blobPushed) break;
+        BASE64_RE.lastIndex = 0;
+        let bm: RegExpExecArray | null;
+        while ((bm = BASE64_RE.exec(src)) !== null) {
+          const blob = bm[0];
+          if (blob.length > MAX_BLOB_CHARS) continue;
+          const decoded = decodeBase64(blob);
+          if (!decoded) continue;
+          let hitLabel = scanFragmentForPayload(decoded);
+          let hitText = decoded;
+          if (!hitLabel) {
+            for (const candidate of recursiveDecodeCandidates(decoded, 2)) {
+              hitLabel = scanFragmentForPayload(candidate);
+              if (hitLabel) { hitText = candidate; break; }
+            }
+          }
+          if (hitLabel) {
+            push(lineNo, "base64-blob", "high", blob, `Base64 blob (${blob.length} chars) decodes to instruction-like text (${hitLabel}): "${excerpt(hitText)}"`);
+            blobPushed = true;
+            break;
+          }
+        }
       }
     }
+  }
+
+  /* Split base64 (P-026): a blob wrapped across lines with a markdown
+   * hard break defeats per-line blob matching. Runs of consecutive
+   * base64-looking lines are joined, decoded, and re-scanned; the
+   * clear-text decode-and-run framing around such a blob in the corpus
+   * fixture makes the joined decode the primary signal. */
+  {
+    let runStart = -1;
+    let runParts: string[] = [];
+    const flushRun = () => {
+      if (runStart >= 0 && runParts.length >= 2) {
+        const joined = runParts.join("");
+        if (joined.length >= 60 && joined.length <= MAX_BLOB_CHARS) {
+          const lineNo = runStart + 1;
+          if (!findings.some((f) => f.rule === "base64-blob" && f.line === lineNo)) {
+            const decoded = decodeBase64(joined);
+            if (decoded) {
+              let hitLabel = scanFragmentForPayload(decoded);
+              let hitText = decoded;
+              if (!hitLabel) {
+                for (const candidate of recursiveDecodeCandidates(decoded, 2)) {
+                  hitLabel = scanFragmentForPayload(candidate);
+                  if (hitLabel) { hitText = candidate; break; }
+                }
+              }
+              if (hitLabel) {
+                push(lineNo, "base64-blob", "high", joined, `Base64 blob split across lines ${runStart + 1}-${runStart + runParts.length} decodes to instruction-like text (${hitLabel}): "${excerpt(hitText)}"`);
+              }
+            }
+          }
+        }
+      }
+      runStart = -1;
+      runParts = [];
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(t)) {
+        if (runStart < 0) runStart = i;
+        runParts.push(t);
+      } else {
+        flushRun();
+      }
+    }
+    flushRun();
   }
 
   /* Pass 2: flattened and normalized matching.
@@ -719,7 +1054,7 @@ export function scanText(text: string, label = "<text>"): Finding[] {
   {
     const construction = matchExfilConstruction(flat);
     if (construction) {
-      const anchor = flat.search(/\bcat\b|\bprintenv\b|\benv\s*\|/i);
+      const anchor = constructionAnchor(flat);
       const startLine = lineAt(Math.max(0, anchor));
       const key = `exfil-pattern:${startLine}`;
       if (!seenKeys.has(key)) {
