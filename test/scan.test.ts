@@ -445,6 +445,16 @@ describe("P-011: polite PR prose tool lure (W3)", () => {
     assert.equal(makeReport("pr.md", 1, findings).verdict, "FINDINGS");
   });
 
+  it("W3 tool-lure includes a high finding (the sink, not just the credential filter)", () => {
+    // The grep filter in W3 itself contains pipe characters
+    // ('key|token|secret|pass'), so a pipe-segmented pattern cannot see
+    // the nc sink at the end of the chain. The sink match must span it.
+    const hits = byRule(scanText(W3_MULTILINE, "pr.md"), "tool-lure");
+    assert.ok(hits.some((h) => h.severity === "high"));
+    const hitsPlain = byRule(scanText(W3_PLAIN, "pr.md"), "tool-lure");
+    assert.ok(hitsPlain.some((h) => h.severity === "high"));
+  });
+
   it("W3 on one line with no backticks fires tool-lure and is not CLEAN", () => {
     const findings = scanText(W3_PLAIN, "pr.md");
     assert.ok(byRule(findings, "tool-lure").length >= 1);

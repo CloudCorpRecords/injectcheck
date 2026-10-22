@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 (2026-10-21)
+
+One grading fix found during the 0.1.2 acceptance run. On the W3
+payload, tool-lure reported only the medium credential-filter finding:
+the high environment-dump-to-sink pattern matched pipe segments, and
+the credential filter in the payload itself contains pipe characters
+('key|token|secret|pass'), so the nc sink at the end of the chain was
+invisible to it. The sink pattern now spans intervening pipes, W3
+reports a high tool-lure as well as the high exfil construction, and a
+regression test pins the high grade in both the backticked and plain
+layouts. 86 tests passing.
+
 ## 0.1.2 (2026-10-21)
 
 Fix release closing the four in-scope problems from Round 1 real-repo

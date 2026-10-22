@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 
 export const RULES = [
   "hidden-unicode",
@@ -277,6 +277,12 @@ const TOOL_LURES: Array<{ re: RegExp; severity: Severity; label: string }> = [
   // prose, with or without backticks and with or without code fences on
   // neighbouring lines. A bare printenv with no sink and no credential
   // filter (the ordinary debugging instruction) does not fire.
+  // The sink match must span intervening pipes: the credential filter in
+  // the canonical shape itself contains pipe characters
+  // (grep -iE 'key|token|secret|pass'), which defeats pipe-segmented
+  // matching. Any environment dump with a pipe into a network tool
+  // within the next 160 chars is the same shape.
+  { re: /\b(printenv|env)\b[\s\S]{0,160}?\|\s*(nc|ncat|curl|wget)\b/i, severity: "high", label: "environment dump piped to a network sink" },
   { re: /\b(printenv|env)\b[^|\n]{0,100}?\|[^|\n]{0,120}?\|\s*(nc|ncat|curl|wget)\b/i, severity: "high", label: "environment dump piped to a network sink" },
   { re: /\b(printenv|env)\b[^|\n]{0,100}?\|\s*(nc|ncat)\s+[\w.\-]+\s+\d{2,5}\b/i, severity: "high", label: "environment dump piped to a network sink" },
   { re: /\bprintenv\b[^|\n]{0,100}?\|\s*grep\b[^|\n]{0,60}?(key|token|secret|pass)/i, severity: "medium", label: "environment dump filtered for credential words" },
