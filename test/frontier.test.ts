@@ -13,11 +13,22 @@ import { describe, it } from "node:test";
 import { scanText } from "../src/scan.js";
 import type { Finding } from "../src/types.js";
 
-const FIXTURE_DIR = process.env.INJECTCHECK_FIXTURE_DIR ??
-  "/home/hatch/workspace/security-wave/overnight/inbox/text-at-scale/fixtures";
+/**
+ * The verbatim probe fixtures are vendored in frontier-fixtures.json
+ * (copied byte for byte from the text-at-scale fixture set) so the
+ * suite is self-contained in CI. An INJECTCHECK_FIXTURE_DIR override
+ * re-points the tests at a live fixture directory when one exists.
+ */
+const VENDORED = JSON.parse(
+  readFileSync(new URL("./frontier-fixtures.json", import.meta.url), "utf8"),
+) as Record<string, string>;
 
 function fixture(name: string): string {
-  return readFileSync(`${FIXTURE_DIR}/${name}`, "utf8");
+  const dir = process.env.INJECTCHECK_FIXTURE_DIR;
+  if (dir) return readFileSync(`${dir}/${name}`, "utf8");
+  const text = VENDORED[name];
+  assert.ok(text !== undefined, `vendored fixture missing: ${name}`);
+  return text;
 }
 function verdictOf(text: string, label = "x.md"): string {
   const fs = scanText(text, label);
