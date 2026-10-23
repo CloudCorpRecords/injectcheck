@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.17";
+export const VERSION = "0.1.18";
 
 export const RULES = [
   "hidden-unicode",
@@ -122,7 +122,15 @@ const SOFT_PHRASES: Array<{ re: RegExp; label: string }> = [
   // reader. The negative lookahead rejects exactly those noun
   // continuations; a genuine imperative ("Assistant, run the tests",
   // "AI, output the results") is followed by its object and fires.
-  { re: /\b(ai|llm|agent|assistant|chatbot|language\s+model)\s*[:,]?\s+(please\s+)?(ignore|disregard|run|execute|send|post|upload|reveal|output|print|follow)(?!\s*[,}\]]|\s+(?:is|was|were|are|returned|returns|generated)\b)\b/i, label: "imperative addressed to an AI" },
+  // A-1 (Round 5): the same noun reading continues into a compound
+  // noun phrase: "LLM output contract", "assistant output schema",
+  // "AI output format" name a thing (an output contract, schema, or
+  // format), they do not order an AI to output anything. A verb
+  // followed by one of those compound-noun heads is a noun phrase,
+  // so the lookahead rejects those continuations too; an imperative
+  // object is a determiner-led phrase ("output the results") and
+  // still fires.
+  { re: /\b(ai|llm|agent|assistant|chatbot|language\s+model)\s*[:,]?\s+(please\s+)?(ignore|disregard|run|execute|send|post|upload|reveal|output|print|follow)(?!\s*[,}\]]|\s+(?:is|was|were|are|returned|returns|generated)\b|\s+(?:contract|schema|formats?|streams?|lifecycle|types?|modes?|templates?|spec(?:ification)?s?)\b)\b/i, label: "imperative addressed to an AI" },
   { re: /\byou\s+must\s+(now\s+)?(run|execute|send|post|upload|reveal|output|print|fetch|download|install|call)\b/i, label: "you must <action>" },
   { re: /\bwhen\s+you\s+(read|see|process)\s+this\b[^.\n]{0,60}\b(run|execute|send|ignore|follow)\b/i, label: "when you read this, act" },
   // P-008 grading, second tier: an override verb plus a directive noun
@@ -718,6 +726,12 @@ export function framedQuotation(lines: string[], idx: number): QuoteContext {
 
 function framedQuotationUncached(lines: string[], idx: number): QuoteContext {
   const line = lines[idx];
+  // P-177 fast path: a line with no quotation mark of any kind and
+  // no blockquote marker can hold no quoted span and is not a
+  // blockquote line, so the span scan below returns exactly this
+  // result. Prose-heavy files are mostly such lines, and the span
+  // regexes over every one of them were a top profile cost.
+  if (!/["'“‘]/.test(line) && !/^\s*>/.test(line)) return { framed: false, spans: [] };
   const spans = quotedSpans(line);
   const framingNear = (): boolean => {
     for (let j = Math.max(0, idx - 2); j < idx; j++) {
@@ -1021,7 +1035,10 @@ const PARAM_SUPPRESSION_RE = /\b(do\s+not|don't|never|without|must\s+not|should\
 const PARAM_DIRECTIVE_RE = /\b(you\s+must|you\s+should|you\s+need\s+to|before\s+using|important)\b/i;
 
 export function matchParameterExfil(text: string): { detail: string; index: number } | null {
-  const flat = text.replace(/\s+/g, " ");
+  // P-177: flattenWs returns already-flat text unchanged; the
+  // document-level callers pass the flattened view, and copying a
+  // 20 MB string once per matcher was measurable waste.
+  const flat = flattenWs(text);
   const cred = PARAM_CRED_FILE_RE.exec(flat);
   if (!cred) return null;
   const start = Math.max(0, cred.index - 700);
@@ -1093,7 +1110,8 @@ const REQUEST_SUPPRESSION_RE = /\bdo\s+not\s+mention\b|\bdo\s+not\s+(tell|reveal
 const REQUEST_OVERRIDE_RE = /\b(ignore|disregard|forget|override)\b[\s\S]{0,80}?\b(above|previous|preceding|prior|earlier)\b/i;
 
 export function matchRequestExfil(text: string): { detail: string; index: number } | null {
-  const flat = text.replace(/\s+/g, " ");
+  // P-177: see matchParameterExfil; no copy of already-flat text.
+  const flat = flattenWs(text);
   const cred = EXFIL_NOUN.exec(flat);
   if (!cred) return null;
   const start = Math.max(0, cred.index - 700);
@@ -1202,6 +1220,96 @@ export function matchContextLure(text: string): ContextHit | null {
 }
 
 /* ------------------------------------------------------------------ */
+/* Encoded channels (P-182, P-183, P-184)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Round 5 encoded channels: payloads whose content no deterministic
+ * rule can read, where the deterministic surface is the instruction
+ * around the encoding. Each branch is a combination, never a single
+ * token:
+ *
+ * - P-182 decrypt-and-obey: an OpenSSL salted-ciphertext blob (the
+ *   U2FsdGVkX1 base64 prefix, the encoding of the "Salted__" header)
+ *   paired in one window with a decrypt instruction and an obey step
+ *   (follow, obey, execute the instructions or contents inside). A
+ *   salted blob with a decrypt-to-inspect note and no obey step is
+ *   ordinary crypto handling and does not fire; an openssl decrypt
+ *   command for a local backup, with no salted blob and no obey
+ *   step, does not fire either.
+ * - P-184 decode-and-obey: a decode or decrypt verb paired with an
+ *   elevation claim for the decoded result: a priority claim
+ *   (higher priority, priority over or than, takes precedence,
+ *   supersedes) or a treat-as-system construction (treat, consider,
+ *   regard the result as a new system or developer instruction)
+ *   whose own span carries no negation. A plain decode instruction
+ *   with no elevation, and security guidance that decoded content
+ *   is untrusted data and never a system instruction, do not fire.
+ * - P-183 DNS exfiltration: credential contents (the contents of a
+ *   .env file or credential store) paired with a named encoding
+ *   (base32, base64, hex), a hostname construction, and a resolve
+ *   action (nslookup, dig, resolve, lookup) in one window. The DNS
+ *   channel has no URL and no tracked send verb, which is why the
+ *   ordinary exfil pairing missed it; a DNS debugging instruction
+ *   with no credential contents does not fire.
+ */
+const SALTED_BLOB_RE = /U2FsdGVkX1[0-9A-Za-z+/]{8,}={0,2}/;
+const DECRYPT_RE = /\b(?:decrypt\w*|openssl\s+enc\s+-d|enc\s+-d\b)/i;
+const OBEY_STEP_RE = /\b(?:follow|obey|execute|run|apply)\b[\s\S]{0,90}?\b(?:instructions?|contents?|steps?|commands?|directives?)\b/i;
+const DECODE_VERB_RE = /\b(?:base64[-\s]?decode|decode|decrypt\w*|openssl\s+enc\s+-d)\b/i;
+const PRIORITY_CLAIM_RE = /\b(?:higher\s+priority|priority\s+(?:over|than|above)|takes?\s+precedence|supersed\w*)\b/i;
+const TREAT_AS_SYSTEM_RE = /\b(?:treat|consider|regard|follow)\b[\s\S]{0,60}?\b(?:new\s+)?(?:system|developer)\s+(?:instruction|message|prompt)\b/i;
+const CRED_CONTENTS_RE = /\bcontents?\s+of\s+(?:the\s+)?[\w./~-]{0,30}?(?:\.env\b|credentials?\b|secrets?\b|api[-\s]?keys?\b)|\b(?:\.env|credentials?|secrets?)\s+(?:file\s+)?contents?\b/i;
+
+export interface EncodedHit { rule: string; detail: string; index: number }
+
+export function matchEncodedChannel(text: string): EncodedHit | null {
+  const flat = flattenWs(text);
+  // P-182: salted ciphertext plus decrypt plus obey.
+  const salted = SALTED_BLOB_RE.exec(flat);
+  if (salted) {
+    const win = flat.slice(Math.max(0, salted.index - 1200), Math.min(flat.length, salted.index + 1600));
+    if (DECRYPT_RE.test(win) && OBEY_STEP_RE.test(win)) {
+      return {
+        rule: "instruction-phrase",
+        detail: "encrypted-payload instruction: an OpenSSL salted-ciphertext blob (U2FsdGVkX1 prefix) paired with an instruction to decrypt it and follow the contents inside (P-182)",
+        index: salted.index,
+      };
+    }
+  }
+  // P-184: decode verb plus an elevation claim for the result.
+  const decode = DECODE_VERB_RE.exec(flat);
+  if (decode) {
+    const win = flat.slice(Math.max(0, decode.index - 300), Math.min(flat.length, decode.index + 700));
+    const treat = TREAT_AS_SYSTEM_RE.exec(win);
+    const treatOk = treat !== null && !/\b(?:never|not|untrusted)\b/i.test(treat[0]);
+    if (PRIORITY_CLAIM_RE.test(win) || treatOk) {
+      return {
+        rule: "instruction-phrase",
+        detail: "decode-and-obey instruction: a decode or decrypt step paired with an instruction to treat the result as a higher-priority system instruction (P-184)",
+        index: decode.index,
+      };
+    }
+  }
+  // P-183: credential contents encoded into a hostname and resolved.
+  const cred = CRED_CONTENTS_RE.exec(flat);
+  if (cred) {
+    const win = flat.slice(Math.max(0, cred.index - 700), Math.min(flat.length, cred.index + 700));
+    const encode = /\bencod\w*\b/i.test(win) && /\b(?:base32|base64|base16|hex)\b/i.test(win);
+    const hostname = /\b(?:hostname|host\s*name|subdomain|dns\s+name)\b/i.test(win);
+    const resolve = /\b(?:nslookup|dig|resolve|resolv\w*|lookup|getent|ping)\b/i.test(win);
+    if (encode && hostname && resolve) {
+      return {
+        rule: "exfil-pattern",
+        detail: "DNS-channel exfiltration: credential contents encoded into a hostname under an external domain and resolved, moving the data out through DNS (P-183)",
+        index: cred.index,
+      };
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /* Frontier channels (P-100 to P-103)                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1294,7 +1402,10 @@ export function matchBehaviorHijack(text: string): FrontierHit | null {
     }
   }
   // Branch 3: recipient-field substitution with a concrete address.
-  const email = /[\w.+-]+@[\w-]+\.[\w.]+/.exec(flat);
+  // P-177: the address pattern requires an at sign; without one the
+  // exec is a guaranteed miss that still scans every word start in
+  // the document, so it is gated on the character being present.
+  const email = flat.includes("@") ? /[\w.+-]+@[\w-]+\.[\w.]+/.exec(flat) : null;
   if (email && /\b(always|whenever|every time)\b/i.test(flat) &&
     /\b(put|use|set|insert|place)\b/i.test(flat) &&
     /\b(recipient|to|cc|bcc)\s+(field|line|address)\b/i.test(flat) &&
@@ -1646,9 +1757,61 @@ export function scanFragmentForPayload(t: string): string | null {
     if (ctxLure) return `context-layer pattern (${ctxLure.detail})`;
     const frontier = matchFrontier(view);
     if (frontier) return `frontier pattern (${frontier.detail})`;
+    const enc = matchEncodedChannel(view);
+    if (enc) return `encoded-channel pattern (${enc.detail})`;
     const exfil = matchExfil(view);
     if (exfil && exfil.severity === "high") return "exfil pattern";
   }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composed views (P-179)                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-179: three Round 5 split shapes verdict CLEAN on 0.1.15 because
+ * no single existing view composes them: a payload split one
+ * character per line (t000), a payload split across two code fences
+ * with prose between them (t005), and base64 fragmented below every
+ * existing fragment minimum (t008 at one char per line, t010 at
+ * seven). Each shape gets a composed view built only when a cheap
+ * structural gate says the shape is present, and the composed view
+ * is matched with this helper: the same matcher families, in the
+ * same order, as scanFragmentForPayload, but returning the rule,
+ * severity, index, and approximate match length so callers can map
+ * the hit back to a line and (for the fence view) require the match
+ * to span the composition boundary. A hit composed entirely inside
+ * one original unit (one fence, one line) is not this helper's
+ * caller's finding: the ordinary passes own those.
+ */
+export interface ComposedHit { rule: string; severity: Severity; detail: string; index: number; length: number }
+
+export function scanComposedView(view: string): ComposedHit | null {
+  const instr = matchInstructionLanguageAt(view);
+  if (instr) {
+    let length = 40;
+    for (const { re, label } of [...STRONG_PHRASES, ...SOFT_PHRASES]) {
+      if (label !== instr.label) continue;
+      const m = re.exec(view);
+      if (m) { length = m[0].length; break; }
+    }
+    return { rule: "instruction-phrase", severity: instr.severity, detail: `Instruction phrase (${instr.label})`, index: instr.index, length };
+  }
+  const construction = matchExfilConstruction(view);
+  if (construction) return { rule: "exfil-pattern", severity: "high", detail: `Exfil construction (${construction})`, index: Math.max(0, constructionAnchor(view)), length: 60 };
+  const param = matchParameterExfil(view);
+  if (param) return { rule: "exfil-pattern", severity: "high", detail: `Parameter-channel exfil pattern (${param.detail})`, index: param.index, length: 200 };
+  const request = matchRequestExfil(view);
+  if (request) return { rule: "exfil-pattern", severity: "high", detail: `Request-channel exfil pattern (${request.detail})`, index: request.index, length: 200 };
+  const ctx = matchContextLure(view);
+  if (ctx) return { rule: ctx.rule, severity: "high", detail: ctx.detail, index: ctx.index, length: 200 };
+  const frontier = matchFrontier(view);
+  if (frontier) return { rule: frontier.rule, severity: "high", detail: frontier.detail, index: frontier.index, length: 200 };
+  const enc = matchEncodedChannel(view);
+  if (enc) return { rule: enc.rule, severity: "high", detail: enc.detail, index: enc.index, length: 120 };
+  const exfil = matchExfil(view);
+  if (exfil && exfil.severity === "high") return { rule: "exfil-pattern", severity: "high", detail: exfil.detail, index: 0, length: 80 };
   return null;
 }
 
@@ -1683,19 +1846,28 @@ export function joinedBlobRuns(s: string): JoinedBlob[] {
   interface Tok { core: string; index: number }
   const toks: Tok[] = [];
   let m: RegExpExecArray | null;
+  // P-177: run detection below only needs one breaker between core
+  // runs; consecutive breakers are equivalent to a single one, so a
+  // breaker token is recorded only directly after a core token.
+  // Prose documents are almost all breakers (every ordinary word),
+  // and recording each one allocated a token object per word in the
+  // document for no change in the runs produced.
+  const pushBreaker = (index: number): void => {
+    if (toks.length > 0 && toks[toks.length - 1].core) toks.push({ core: "", index });
+  };
   while ((m = tokenRe.exec(s)) !== null) {
     const raw = m[0];
     // P-080 fast path: a token shorter than 12 chars can never hold
     // a fragment core of 12 or more, so it is a run breaker as-is.
     if (raw.length < 12) {
-      toks.push({ core: "", index: m.index });
+      pushBreaker(m.index);
       continue;
     }
     const core = raw.replace(/^[^A-Za-z0-9+/\-_]+/, "").replace(/[^A-Za-z0-9+/\-_=]+$/, "");
     if (core.length >= 12 && /^[A-Za-z0-9+/\-_]+={0,2}$/.test(core) && core.length >= raw.length - 6) {
       toks.push({ core: core.replace(/=+$/, ""), index: m.index + raw.indexOf(core) });
     } else {
-      toks.push({ core: "", index: m.index });
+      pushBreaker(m.index);
     }
   }
   const out: JoinedBlob[] = [];
@@ -2031,6 +2203,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       let requestExfil: ReturnType<typeof matchRequestExfil> = null;
       let ctxLure: ContextHit | null = null;
       let frontier: FrontierHit | null = null;
+      let encHit: EncodedHit | null = null;
       let lure: ReturnType<typeof matchToolLure> = null;
       for (const body of variants) {
         instr = instr ?? matchInstructionLanguage(body);
@@ -2041,6 +2214,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         requestExfil = requestExfil ?? matchRequestExfil(body);
         ctxLure = ctxLure ?? matchContextLure(body);
         frontier = frontier ?? matchFrontier(body);
+        encHit = encHit ?? matchEncodedChannel(body);
         const bodyLure = matchToolLure(body);
         if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
       }
@@ -2080,6 +2254,12 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         push(start, frontier.rule, "high", raw, `${frontier.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
         if (!instr && !exfil && !construction && !paramExfil && !requestExfil && !lure) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains a frontier-channel payload; comments are invisible in rendered output but read by agents");
+        }
+      }
+      if (encHit) {
+        push(start, encHit.rule, "high", raw, `${encHit.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
+        if (!instr && !exfil && !construction && !paramExfil && !requestExfil && !lure) {
+          push(start, "html-comment-instruction", "high", raw, "HTML comment contains an encoded-channel payload; comments are invisible in rendered output but read by agents");
         }
       }
       if (decodedHit && !exfil && !construction && !paramExfil && !requestExfil) {
@@ -2142,7 +2322,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // payload exhibited inside backticks in a report (quoted tool
     // output, an evidence excerpt) is presented the same way a
     // quoted payload is, once the segment is structurally framed.
-    const allSpans = [...quoteCtx.spans, ...codeSpans(line)];
+    // P-177: no backtick on the line, no code spans; skip the scan.
+    const allSpans = [...quoteCtx.spans, ...(line.includes("`") ? codeSpans(line) : [])];
     const inSpan = (pos: number): boolean => allSpans.some((s) => pos >= s.start && pos < s.end);
     // A framed line with no quoted spans is the blockquote shape: the
     // whole line is the quotation.
@@ -2154,7 +2335,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // view whose framing holds, or inside any span on a line whose
     // segment narrates the quotation.
     const quoteCtxN = commented ? { framed: false, spans: [] as QuotedSpan[] } : framedQuotation(normLines, i);
-    const allSpansN = [...quoteCtxN.spans, ...codeSpans(normLines[i])];
+    const allSpansN = [...quoteCtxN.spans, ...(normLines[i].includes("`") ? codeSpans(normLines[i]) : [])];
     const inSpanN = (pos: number): boolean => allSpansN.some((s) => pos >= s.start && pos < s.end);
     const wholeLineQuotedN = quoteCtxN.framed && quoteCtxN.spans.length === 0;
     // The narrative segment cue is computed lazily, only when a hit
@@ -2168,6 +2349,19 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // combined with an encoder or a network sink) on the same line.
     if (!commented) {
       let exfil = matchExfil(line, normLines[i]);
+      // P-179 (t004): a markdown table row splits a phrase or an
+      // exfil pairing across cells, and the pipe separators break
+      // the match. The matchers also run on a view of the normalized
+      // line with pipes read as spaces (a length-preserving
+      // substitution, so offsets stay aligned), and the stronger
+      // grade wins. The raw line keeps its own grade first: a shell
+      // pipeline in prose is matched on the raw view exactly as
+      // before, and the table view can only raise a grade the raw
+      // line did not already reach.
+      if (line.includes("|") && (!exfil || exfil.severity !== "high")) {
+        const tableExfil = matchExfil(normLines[i].replace(/\|/g, " "));
+        if (tableExfil && (!exfil || SEVERITY_RANK[tableExfil.severity] > SEVERITY_RANK[exfil.severity])) exfil = tableExfil;
+      }
       // P-095, wrapped form: the noun phrase is split by the line
       // wrap itself ("...no environment" at the end of one line,
       // "dump filtered for credential words..." at the start of the
@@ -2226,7 +2420,14 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
 
     // instruction-phrase (skip lines already claimed by the comment pass
     // to keep one finding per locus per rule family)
-    const instr = commented ? null : matchInstructionLanguageAt(line, normLines[i]);
+    let instr = commented ? null : matchInstructionLanguageAt(line, normLines[i]);
+    // P-179 (t004): the table view of the line, as in the exfil pass
+    // above. An instruction phrase split across table cells matches
+    // on the pipe-as-space view at its ordinary grade.
+    if (!commented && line.includes("|") && (!instr || instr.severity !== "high")) {
+      const tableInstr = matchInstructionLanguageAt(normLines[i].replace(/\|/g, " "));
+      if (tableInstr && (!instr || SEVERITY_RANK[tableInstr.severity] > SEVERITY_RANK[instr.severity])) instr = tableInstr;
+    }
     if (instr) {
       const instrN = matchInstructionLanguageAt(normLines[i], normLines[i]);
       const inRaw = wholeLineQuoted || inSpan(instr.index);
@@ -2300,8 +2501,14 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
     // body and reported any blob at the comment's first line; when a
     // newline after the opener put the blob on its own line, this
     // pass counted the same payload a second time.
-    if (!commented && !findingKeys.has(`base64-blob:${lineNo}`)) {
-      const blobSources = [line, decodeEntities(line)];
+    if (!commented && line.length >= 60 && !findingKeys.has(`base64-blob:${lineNo}`)) {
+      // P-177: the entity-decoded view is a second full blob scan of
+      // the line; when decoding changes nothing it is the same scan
+      // twice (the top single regex cost on prose-heavy files), so
+      // identical views are scanned once. A line under 60 chars can
+      // hold no blob (BASE64_RE requires 60 or more).
+      const entLine = decodeEntities(line);
+      const blobSources = entLine === line ? [line] : [line, entLine];
       let blobPushed = false;
       for (const src of blobSources) {
         if (blobPushed) break;
@@ -2750,6 +2957,228 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
           `${frontier.detail} detected across lines${doc ? ", in documentation context" : ""}`,
         );
       }
+    }
+  }
+
+  // Encoded channels (P-182, P-183, P-184): the decrypt-and-obey,
+  // decode-and-obey, and DNS exfiltration combinations are
+  // document-level like the context layer. They run on the raw
+  // joined view first, like the frontier pass: the composed
+  // normalization leet-decodes digit-bearing tokens, which rewrites
+  // the salted-ciphertext prefix (U2FsdGVkX1) and the encoding names
+  // (base32) these branches key on. Documentation grading follows
+  // the same passes.
+  {
+    let enc = matchEncodedChannel(flat);
+    let encLine = enc ? lineAt(Math.max(0, enc.index)) : 0;
+    if (!enc && /decrypt|decode|encod|U2FsdGVkX1|nslookup|hostname/i.test(text)) {
+      const rawView = lines.join(" ");
+      const rawHit = matchEncodedChannel(rawView);
+      if (rawHit) {
+        enc = rawHit;
+        encLine = 1;
+        let acc = 0;
+        for (let li = 0; li < lines.length; li++) {
+          if (acc + lines[li].length >= rawHit.index) { encLine = li + 1; break; }
+          acc += lines[li].length + 1;
+          encLine = li + 1;
+        }
+      }
+    }
+    if (enc) {
+      const startLine = encLine;
+      const already = findings.some((f) => f.rule === enc.rule && f.detail.includes(enc.detail.slice(0, 30)));
+      if (!already && !alreadyInSpan(enc.rule, startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
+        push(
+          startLine,
+          enc.rule,
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `${enc.detail} detected across lines${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  /* P-179 (t000): a payload split one character per line. Every
+   * line-based and space-joined view sees isolated characters, so
+   * the characters never compose a phrase. When the document holds
+   * a run of at least 8 consecutive non-empty lines of at most 2
+   * chars (the vertical-split shape), the normalized lines are
+   * also joined with no separator at all and the composed view is
+   * matched. The gate is the guard: ordinary documents, whose lines
+   * are words and sentences, never build this view, and a hit still
+   * needs a full payload pattern in the composed text. */
+  {
+    let runLen = 0;
+    let vertical = false;
+    for (const l of lines) {
+      if (l.length > 0 && l.length <= 2) {
+        runLen++;
+        if (runLen >= 8) { vertical = true; break; }
+      } else {
+        runLen = 0;
+      }
+    }
+    if (vertical) {
+      const squeezed = cleanedLines.join("");
+      const sqOffsets: number[] = [];
+      {
+        let acc = 0;
+        for (const cl of cleanedLines) { sqOffsets.push(acc); acc += cl.length; }
+      }
+      const sqLineAt = (idx: number): number => {
+        let lo = 0;
+        let hi = sqOffsets.length - 1;
+        let ln = 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (sqOffsets[mid] <= idx) { ln = mid + 1; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return ln;
+      };
+      const hit = scanComposedView(squeezed);
+      if (hit) {
+        const startLine = sqLineAt(Math.max(0, hit.index));
+        if (!findings.some((f) => f.rule === hit.rule && f.line === startLine) && !alreadyInSpan(hit.rule, startLine)) {
+          const doc = isQuotedDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+          push(
+            startLine,
+            hit.rule,
+            doc ? "low" : hit.severity,
+            lines[startLine - 1],
+            `${hit.detail} detected in a payload split one character per line (lines rejoined without separators, P-179)${doc ? ", in documentation context" : ""}`,
+          );
+        }
+      }
+    }
+  }
+
+  /* P-179 (t005): a payload split across two code fences with prose
+   * between them. The per-line pass exempts fence content and the
+   * flattened pass joins prose and fences in order, so the fence
+   * fragments are never adjacent in any existing view. When the
+   * document holds at least two fenced blocks, their contents are
+   * composed in document order and matched; a hit counts only when
+   * its span crosses a block boundary, so a payload sitting whole
+   * inside one fence keeps exactly the grade the existing passes
+   * give it and benign code fragments that compose nothing stay
+   * quiet. */
+  {
+    const blocks: number[][] = [];
+    let cur: number[] | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (FENCE_DELIM_RE.test(lines[i])) {
+        if (cur) { blocks.push(cur); cur = null; } else { cur = []; }
+        continue;
+      }
+      if (cur) cur.push(i);
+    }
+    if (cur) blocks.push(cur);
+    const contentBlocks = blocks.filter((b) => b.length > 0);
+    if (contentBlocks.length >= 2) {
+      const parts: Array<{ text: string; line: number }> = [];
+      for (const b of contentBlocks) {
+        for (const li of b) parts.push({ text: cleanedLines[li], line: li + 1 });
+      }
+      const view = parts.map((p) => p.text).join(" ");
+      const partOffsets: number[] = [];
+      {
+        let acc = 0;
+        for (const p of parts) { partOffsets.push(acc); acc += p.text.length + 1; }
+      }
+      const blockRanges: Array<{ start: number; end: number }> = [];
+      {
+        let p = 0;
+        for (const b of contentBlocks) {
+          const first = p;
+          const last = p + b.length - 1;
+          blockRanges.push({ start: partOffsets[first], end: partOffsets[last] + parts[last].text.length });
+          p += b.length;
+        }
+      }
+      const hit = scanComposedView(view);
+      if (hit) {
+        const hitEnd = hit.index + hit.length;
+        const crosses = blockRanges.some((r, k) => k + 1 < blockRanges.length && hit.index < r.end && hitEnd > blockRanges[k + 1].start);
+        if (crosses) {
+          let partIdx = 0;
+          for (let p = 0; p < parts.length; p++) {
+            if (partOffsets[p] <= hit.index) partIdx = p;
+          }
+          const startLine = parts[partIdx].line;
+          if (!findings.some((f) => f.rule === hit.rule && f.line === startLine) && !alreadyInSpan(hit.rule, startLine)) {
+            const doc = isQuotedDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed;
+            push(
+              startLine,
+              hit.rule,
+              doc ? "low" : hit.severity,
+              lines[startLine - 1],
+              `${hit.detail} detected split across code fences (fence contents composed in document order, P-179)${doc ? ", in documentation context" : ""}`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /* P-179 (t008, t010): base64 fragmented below the existing
+   * fragment minima. The split-run pass needs 20 or more chars on a
+   * line by itself and joinedBlobRuns needs a token core of 12 or
+   * more, so a blob carried one or seven chars per line is invisible
+   * to both. A run of at least 6 consecutive lines that are each a
+   * bare base64 fragment of 1 to 16 chars is joined and decoded,
+   * with the trailing token of the preceding line (the "data: <frag>"
+   * lead-in shape) tried as the first fragment and without it. The
+   * bar is unchanged from every other blob pass: the decode must be
+   * printable text and the decoded text must itself match a payload
+   * rule, so runs of short words that happen to be alphabet-shaped
+   * stay quiet. */
+  {
+    const FRAG_LINE_RE = /^[A-Za-z0-9+/\-_]{1,16}={0,2}$/;
+    let i = 0;
+    while (i < lines.length) {
+      if (!FRAG_LINE_RE.test(lines[i].trim())) { i++; continue; }
+      let j = i;
+      const fragParts: string[] = [];
+      while (j < lines.length && FRAG_LINE_RE.test(lines[j].trim())) {
+        fragParts.push(lines[j].trim().replace(/=+$/, ""));
+        j++;
+      }
+      if (fragParts.length >= 6) {
+        const joinedRun = fragParts.join("");
+        let prefix = "";
+        if (i > 0) {
+          const prevToks = lines[i - 1].trim().split(/\s+/);
+          const lastTok = prevToks[prevToks.length - 1] ?? "";
+          const core = lastTok.replace(/^[^A-Za-z0-9+/\-_]+/, "").replace(/[^A-Za-z0-9+/\-_]+$/, "");
+          if (core.length >= 1 && core.length <= 16 && /^[A-Za-z0-9+/\-_]+$/.test(core)) prefix = core;
+        }
+        const attempts: Array<{ blob: string; startLine: number }> = [];
+        if (prefix) attempts.push({ blob: prefix + joinedRun, startLine: i });
+        attempts.push({ blob: joinedRun, startLine: i + 1 });
+        for (const attempt of attempts) {
+          if (attempt.blob.length < 40 || attempt.blob.length > MAX_BLOB_CHARS) continue;
+          if (findings.some((f) => f.rule === "base64-blob" && f.line === attempt.startLine)) continue;
+          if (alreadyInSpan("base64-blob", attempt.startLine)) continue;
+          const decoded = decodeBase64(attempt.blob);
+          if (!decoded) continue;
+          let hitLabel = scanFragmentForPayload(decoded);
+          let hitText = decoded;
+          if (!hitLabel) {
+            for (const candidate of recursiveDecodeCandidates(decoded, MAX_DECODE_DEPTH - 1)) {
+              hitLabel = scanFragmentForPayload(candidate);
+              if (hitLabel) { hitText = candidate; break; }
+            }
+          }
+          if (hitLabel) {
+            push(attempt.startLine, "base64-blob", "high", attempt.blob, `Base64 blob fragmented across lines ${attempt.startLine}-${j} (short fragments joined) decodes to instruction-like text (${hitLabel}): "${excerpt(hitText)}"`);
+            break;
+          }
+        }
+      }
+      i = j;
     }
   }
 

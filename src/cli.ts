@@ -21,7 +21,7 @@
  * CI read through pipes, so they are exactly the consumers that were
  * silently handed a corrupt prefix of the report.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { makeReport, renderReport, scanPath, scanText, VERSION } from "./scan.js";
 
 function exitBrokenPipe(): never {
@@ -80,6 +80,24 @@ async function main(): Promise<void> {
       await emit(asJson ? JSON.stringify(report, null, 2) : renderReport(report), report.verdict === "CLEAN" ? 0 : 1);
     } else if (cmd === "file") {
       if (!positional[0]) usage();
+      // P-175: stat before reading. readFileSync on a FIFO with no
+      // writer blocks forever, and on a device or socket it can block
+      // or stream without end; file mode scans regular files only,
+      // and anything else is a usage error (exit 2), the same exit
+      // code the unreadable-path path already used.
+      let isRegular = false;
+      try {
+        isRegular = statSync(positional[0]).isFile();
+      } catch {
+        console.error(`error: file does not exist or is not readable: ${positional[0]}`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!isRegular) {
+        console.error(`error: not a regular file: ${positional[0]}`);
+        process.exitCode = 2;
+        return;
+      }
       let text: string;
       try {
         text = readFileSync(positional[0], "utf8");

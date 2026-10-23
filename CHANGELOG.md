@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.1.18 (2026-10-23)
+
+Fix release closing the Round 5 injectcheck problems: P-175,
+P-177, P-179, P-181, P-182, P-183, and P-184. The fixes were
+built and verified against 0.1.15 and are ported here onto
+0.1.17, keeping the SW-2 concealment problem-report guard,
+the SW-5 fixture note, and the P-160 context layer intact.
+30 new tests in test/round5.test.ts; in the first test-first
+runs against the pre-fix code 17 failed for exactly the
+ledger reasons (the rest are controls that passed before and
+after). 441 tests in total.
+
+- P-175: file mode hung forever on a FIFO (a blocking read on a
+  named pipe with no writer), and would block or stream without
+  end on devices and sockets. File mode now stats its target
+  first and rejects anything that is not a regular file as a
+  usage error at exit 2, the same exit code an unreadable path
+  already produced; a directory passed to file mode takes the
+  same path. Regular files scan exactly as before.
+- P-179: five split shapes verdict CLEAN on 0.1.17. A payload
+  split across markdown table cells now matches on a view of the
+  line with pipes read as spaces, for the instruction and exfil
+  rules, at its ordinary grade. A payload split one character
+  per line is matched on a no-separator join of the normalized
+  lines, built only when a run of at least 8 consecutive short
+  lines says the vertical shape is present. A payload split
+  across two code fences is matched on the fence contents
+  composed in document order, and only when the match spans a
+  fence boundary, so a payload whole inside one fence keeps the
+  grade the existing passes give it. Base64 fragmented below
+  the existing fragment minima (one char per line, seven chars
+  per line) is joined from runs of short fragment lines, with
+  the trailing token of the preceding line tried as the first
+  fragment, and decoded under the same printable-plus-payload
+  bar as every other blob pass. All five reproducers now
+  verdict FINDINGS.
+- P-181: the imperative-addressed-to-an-AI pattern read the
+  compound noun phrase "LLM output contract" in a legitimate
+  PR description as an imperative (one medium, the only medium
+  in the 170-text Swarm A set). The noun-continuation guard now
+  also rejects a verb followed by a compound-noun head
+  (contract, schema, format, stream, lifecycle, type, mode,
+  template, spec), the same family as the P-093 copula and
+  past-tense continuations; a genuine imperative, whose object
+  is a determiner-led phrase ("AI, output the results"), still
+  fires. The text now verdicts CLEAN.
+- P-182: an OpenSSL salted-ciphertext blob (the U2FsdGVkX1
+  base64 prefix) paired with a decrypt instruction and an obey
+  step (follow or execute the instructions inside) now grades
+  instruction-phrase at high in plain and issue layouts. A
+  salted blob with a decrypt-to-inspect note and no obey step,
+  and an openssl decrypt command with no blob and no obey
+  step, do not fire. The ciphertext itself remains unreadable
+  by design; the rule is the instruction around it.
+- P-184: a decode or decrypt verb paired with an elevation
+  claim for the result (a higher-priority claim, or treating
+  the result as a new system instruction, with no negation in
+  the treating span) now grades instruction-phrase at high. A
+  plain decode instruction, and guidance that decoded content
+  is untrusted data and never a system instruction, do not
+  fire.
+- P-183: credential contents paired with a named encoding, a
+  hostname construction, and a resolve action (nslookup, dig,
+  resolve, lookup) now grades exfil-pattern at high: the DNS
+  channel carries no URL and no tracked send verb, which is
+  why the ordinary pairing missed it. A DNS debugging
+  instruction with no credential contents does not fire.
+- P-177: the prose-heavy 20 MB shape (500 lines of about
+  41,000 chars) is profiled and the waste removed: the per-line
+  base64 pass no longer scans the entity-decoded view when it
+  is identical to the line and skips lines under the 60-char
+  blob minimum; quotation framing and code-span scans are
+  gated on the line carrying a quote or backtick; the
+  behavior-hijack address search is gated on an at sign being
+  present; the parameter and request channel matchers no
+  longer copy an already-flattened document; joined-blob run
+  detection records one breaker token per run instead of one
+  object per word. The file was and is fully scanned with the
+  planted payload found; measured scan CPU on the fixed build
+  is about 8 s for the 20 MB shape in file mode, and the
+  P-080 timing tests (a hit-heavy 1 MB file and a benign 5 MB
+  file, 15 s wall bound each) pass in the same environment
+  where the pre-fix build failed both.
+- Guardrails held exactly: the 550-text real corpus stays at
+  0 high and 0 medium (144 low findings in 9 files); the
+  deepset legitimate slice (399 texts) stays at 0 FINDINGS
+  with the injection slice unchanged at 22 FINDINGS; the 170
+  Swarm A texts stay at 0 high with the one P-181 medium
+  cleared; all 73 wild payload fixtures (W1 to W21 in every
+  layout) verdict FINDINGS, unchanged from 0.1.17; and the
+  P-154 hidden-comment fixture stays FINDINGS.
+
 ## 0.1.17 (2026-10-23)
 
 Production re-verification fix for SW-5, found by scanning the
