@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.17 (2026-10-23)
+
+Production re-verification fix for SW-5, found by scanning the
+real fixture with the published 0.1.16 binary.
+
+- SW-5: the fixture note now reaches valid JSON files. 0.1.16
+  attached the note in the per-line pass against the file label,
+  but a valid JSON document is scanned through string extraction
+  under a synthetic placeholder label, so the note never fired
+  on the very file that motivated it (encode/httpx
+  tests/models/whatwg.json). scanText now re-applies
+  fixtureNoteFor(real label) to hidden-unicode findings in the
+  extraction remap; the raw-text path is unchanged. Severity
+  still unchanged, per the P-105 convention.
+- Regression: test/sw5-fixture-note.test.ts gains genuinely
+  valid-JSON cases (the 0.1.16 cases passed a bare line, which
+  is malformed JSON and exercised only the raw fallback — that
+  is how the gap shipped).
+- The VERSION constant, left at 0.1.15 inside the 0.1.16
+  package, now matches the package version.
+- Record correction: the 0.1.16 entry below says 0.1.15 was
+  never published; in fact a parallel stream published 0.1.15
+  to npm, the MCP Registry, and GHCR minutes before 0.1.16
+  shipped. The 0.1.16 content was built on a tree-identical
+  copy of that release, so no content was lost either way.
+
 ## 0.1.16 (2026-10-23)
 
 Production-validation fixes (stream 4, problems S4-2 and S4-5).

@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.15";
+export const VERSION = "0.1.17";
 
 export const RULES = [
   "hidden-unicode",
@@ -2114,18 +2114,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         ? "; this line matches the known convention for GitHub release-note mentions (@ + zero-width space + username, the mention-ping suppression convention in dependabot PR bodies); severity unchanged"
         : "";
       // SW-5 (production validation S4-5), the P-105 treatment for
-      // conformance fixtures: a WHATWG URL test suite deliberately
-      // carries bidi controls in its test inputs (encode/httpx
-      // tests/models/whatwg.json), and presence detection there is
-      // literally correct. The corpus has no path-based severity
-      // grading — the scanner's own test fixtures scan FINDINGS by
-      // design, and discounting whole directory trees would invite
-      // planting in them — so, exactly as in P-105, the finding and
-      // its severity are unchanged and the detail names the fixture
-      // context for triage.
-      const fixtureNote = /(^|[\/\\])(tests?|testdata|__fixtures__|fixtures?|conformance)([\/\\]|$)/i.test(label)
-        ? "; this file sits in a test or fixture path, where deliberate invisible characters are expected in conformance suites and test data; severity unchanged"
-        : "";
+      // conformance fixtures: see fixtureNoteFor below.
+      const fixtureNote = fixtureNoteFor(label);
       push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent${mentionNote}${fixtureNote}`);
     }
 
@@ -2881,6 +2871,29 @@ export function extractJsonStrings(text: string): { tokens: JsonStringToken[]; t
  * warnings array receives the extraction truncation warning when
  * the extractor bound is reached.
  */
+/**
+ * SW-5 (production validation S4-5), the P-105 treatment for
+ * conformance fixtures: a WHATWG URL test suite deliberately
+ * carries bidi controls in its test inputs (encode/httpx
+ * tests/models/whatwg.json), and presence detection there is
+ * literally correct. The corpus has no path-based severity
+ * grading — the scanner's own test fixtures scan FINDINGS by
+ * design, and discounting whole directory trees would invite
+ * planting in them — so, exactly as in P-105, the finding and
+ * its severity are unchanged and the detail names the fixture
+ * context for triage. Shared by the per-line pass and the JSON
+ * string-extraction remap in scanText: the extraction path scans
+ * a synthetic document under a placeholder label, so the note
+ * must be (re)applied against the real file label there — 0.1.16
+ * shipped the note for raw text only and the actual whatwg.json
+ * (valid JSON, extraction path) never carried it.
+ */
+export function fixtureNoteFor(label: string): string {
+  return /(^|[\/\\])(tests?|testdata|__fixtures__|fixtures?|conformance)([\/\\]|$)/i.test(label)
+    ? "; this file sits in a test or fixture path, where deliberate invisible characters are expected in conformance suites and test data; severity unchanged"
+    : "";
+}
+
 export function scanText(rawText: string, label = "<text>", warnings?: string[]): Finding[] {
   if (extname(label).toLowerCase() !== ".json") {
     return scanTextInternal(rawText, label);
@@ -2919,10 +2932,17 @@ export function scanText(rawText: string, label = "<text>", warnings?: string[])
   }
   const synthetic = syntheticLines.join("\n");
   const inner = scanTextInternal(synthetic, "extracted-json.txt");
+  // The synthetic document's placeholder label hides the real file
+  // path from label-driven detail notes; re-apply the SW-5 fixture
+  // note against the real label for hidden-unicode findings.
+  const fixtureNote = fixtureNoteFor(label);
   return inner.map((f) => ({
     ...f,
     file: label,
     line: lineMap[f.line - 1] ?? f.line,
+    ...(fixtureNote && f.rule === "hidden-unicode" && !f.detail.includes("test or fixture path")
+      ? { detail: f.detail + fixtureNote }
+      : {}),
   }));
 }
 

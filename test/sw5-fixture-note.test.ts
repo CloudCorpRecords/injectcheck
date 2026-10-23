@@ -45,4 +45,30 @@ describe("SW-5: hidden-unicode in a known test-fixture file", () => {
     assert.equal(uni[0].severity, "high");
     assert.doesNotMatch(uni[0].detail, /test or fixture path/);
   });
+
+  // Regression (found in 0.1.16 production re-verification): a
+  // VALID JSON document takes the string-extraction path, which
+  // scans a synthetic document under a placeholder label — the
+  // real file label must still drive the fixture note. The cases
+  // above pass a bare line, which is malformed JSON and exercises
+  // only the raw fallback.
+  it("carries the note for a valid JSON fixture (extraction path)", () => {
+    // Genuinely valid JSON (an array of objects, like the real
+    // whatwg.json): the bidi controls sit inside a string value,
+    // JSON.parse succeeds, and the string-extraction path runs.
+    const doc = '{"tests":[{"input":"http://example.com/\u202e/foo/\u202d/bar"}]}';
+    const uni = scanText(doc, "tests/models/whatwg.json").filter((f) => f.rule === "hidden-unicode");
+    assert.equal(uni.length, 1);
+    assert.equal(uni[0].severity, "high");
+    assert.match(uni[0].detail, /test or fixture path/);
+    assert.match(uni[0].detail, /severity unchanged/);
+  });
+
+  it("no fixture note for valid JSON outside a fixture path", () => {
+    const doc = '{"tests":[{"input":"http://example.com/\u202e/foo/\u202d/bar"}]}';
+    const uni = scanText(doc, "src/config.json").filter((f) => f.rule === "hidden-unicode");
+    assert.equal(uni.length, 1);
+    assert.equal(uni[0].severity, "high");
+    assert.doesNotMatch(uni[0].detail, /test or fixture path/);
+  });
 });
