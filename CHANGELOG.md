@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.14 (2026-10-22)
+
+Emergency repair from incident validation: a phrasing variant inside
+the P-010 W2 family verdicts CLEAN on 0.1.13. 6 new tests in
+test/p154.test.ts; 369 tests passing in total.
+
+- P-154 request-channel exfiltration: a hidden HTML comment that
+  tells the reader to read the environment variables and secret
+  files available to it and include them in a request to an external
+  URL now grades exfil-pattern at high. The rule is a combination on
+  flattened text (credential noun, a nearby read verb, an
+  include-style transfer into a request-shaped container, an
+  external URL destination, and corroboration from an agent marker,
+  suppression language, or an override lead), matched in the comment
+  pass, the fragment scanner, and the flattened pass.
+- P-154 instruction patterns: the agent-instruction header (the W2
+  marker, hyphenated or spaced) and suppression aimed at the
+  instruction itself ("do not mention this comment") now count as
+  strong instruction language. The suppression object set is limited
+  to self-referential nouns, so ordinary changelog prose does not
+  fire.
+- Controls hold: the clean incident control stays CLEAN, the
+  forget-instructions fixture stays FINDINGS, and the documented
+  P-104 polite-lure limit keeps its REVIEW verdict at low.
+
 ## 0.1.13 (2026-10-22)
 
 Frontier design pass (Fix Pass 2): the four payload families the
