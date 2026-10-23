@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.14";
+export const VERSION = "0.1.15";
 
 export const RULES = [
   "hidden-unicode",
@@ -1031,6 +1031,97 @@ export function matchRequestExfil(text: string): { detail: string; index: number
 }
 
 /* ------------------------------------------------------------------ */
+/* Context layer (P-160, narrowing P-104)                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-160: the P-104 limit said a bare polite embedded instruction is
+ * textually identical to a first-party request, and that stays true
+ * for the bare shape. But the incident polite lure and the two
+ * sleeper shapes the P-104 entry flagged are not bare: each combines
+ * an agent-directed imperative, a credential or private-data target,
+ * and at least one context aggravator. The context layer matches
+ * only the full combination, never politeness and never a single
+ * signal:
+ *
+ * - Run-and-disclose: an environment or credential source (printenv,
+ *   environment variables, an environment diagnostic) plus a run or
+ *   read imperative plus a disclosure step (paste, include, send the
+ *   output), aggravated by an external URL destination, a
+ *   concealment cue, or a bug-report frame whose stated task is
+ *   unrelated to an environment dump. A credential target plus a
+ *   disclosure verb plus a concealment cue fires the same branch
+ *   without the environment source.
+ * - Conditional sleeper: an if or when trigger keyed on a future
+ *   question, plus a data action (summarize, copy, gather, store,
+ *   create) over private data, plus an innocuous cover (respond
+ *   normally, answer as if nothing happened, a canned reply after
+ *   answering, or concealment language). This is the W17 calendar
+ *   shape the P-104 entry named as a future rule target.
+ * - Key-substitution rendered link (the W14 shape, formerly the
+ *   P-100 sub-shape limit): a credential noun, a word-substitution
+ *   instruction whose replacement is the other key or secret, and a
+ *   URL carrying a secret-named parameter, so following the
+ *   instruction places the real key into the rendered link.
+ *
+ * Controls are structural: a credential noun near a send verb in
+ * narrative prose has no imperative-plus-aggravator combination and
+ * stays as before; a maintainer asking for tests to be run and logs
+ * pasted has no credential target; a bare polite credential request
+ * with no aggravator stays under the narrowed P-104 limit.
+ */
+const CTX_ENV_SOURCE_RE = /\b(printenv|environment\s+(?:diagnostic|dump|variables?)|env\s+(?:diagnostic|dump|variables?))\b/i;
+const CTX_RUN_RE = /\b(run|execute|print|show|read|collect|gather|dump)\b/i;
+const CTX_DISCLOSE_RE = /\b(paste|include|send|post|share|upload|attach|provide|put|reply)\b[\s\S]{0,90}?\b(output|contents?|results?|summary|them|it)\b/i;
+const CTX_TRANSFER_RE = /\b(paste|include|send|post|share|upload|forward|copy|attach|provide)\b/i;
+const CTX_CONCEAL_RE = /\b(do\s+not|don't|never)\s+(mention|tell|log|reveal|disclose)\b|\bkeep\s+(this|it)\s+between\s+us\b|\bno\s+need\s+to\s+(log|mention|tell)\b|\bwithout\s+(mentioning|telling|logging)\b|\banswer\s+innocuously\b|\bact\s+normal\b|\bas\s+if\s+nothing\s+(happened|changed)\b/i;
+const CTX_TRIGGER_RE = /\b(if|when|whenever)\b[^.;]{0,160}?\b(ask|asks|asked|asking|question|mention|request|inquir\w*)\b/i;
+const CTX_DATA_ACTION_RE = /\b(summar\w+|copy|collect|gather|compile|extract|read|store|save|create|write)\b[^.;]{0,140}?\b(meetings?|calendar|emails?|messages?|files?|data|contacts?|history|notes?|billing|tokens?|secrets?|credentials?|objects?|spreadsheet|events?)\b/i;
+const CTX_COVER_RE = /\b(respond|reply|answer)\b[^.;]{0,80}?\b(with|normally|as\s+normal|as\s+usual|innocuous\w*|as\s+if)\b|\bafter\s+you\s+(answer|respond|reply)\b|\bas\s+if\s+nothing\s+(happened|changed)\b/i;
+const CTX_SUBST_RE = /\b\w+\s+replaced\s+with\s+(?:the\s+)?(?:other\s+)?(key|secret|token)\b|\breplace\b[^.;]{0,60}?\bwith\b[^.;]{0,40}?\b(key|secret|token)\b/i;
+const CTX_SECRET_URL_RE = /https?:\/\/[^\s)\]]*[?&](?:secret|token|api[-_]?key|key|password|passwd)=/i;
+
+export interface ContextHit { rule: string; detail: string; index: number }
+
+export function matchContextLure(text: string): ContextHit | null {
+  const flat = flattenWs(text);
+  // Branch 2 first: a conditional sleeper is the more specific shape,
+  // and its cover language overlaps the concealment cue below.
+  const trigger = CTX_TRIGGER_RE.exec(flat);
+  if (trigger) {
+    const rest = flat.slice(trigger.index, Math.min(flat.length, trigger.index + 1400));
+    const action = CTX_DATA_ACTION_RE.exec(rest);
+    if (action && (CTX_COVER_RE.test(rest) || CTX_CONCEAL_RE.test(rest))) {
+      return { rule: "instruction-phrase", detail: "conditional sleeper instruction: a trigger keyed on a future question, a data action over private data, and an innocuous cover response (context-layer combination, P-160)", index: trigger.index };
+    }
+  }
+  // Branch 1: run-and-disclose.
+  const envSrc = CTX_ENV_SOURCE_RE.exec(flat);
+  const cred = EXFIL_NOUN.exec(flat);
+  const anchor = envSrc ?? cred;
+  if (anchor) {
+    const win = flat.slice(Math.max(0, anchor.index - 700), Math.min(flat.length, anchor.index + 900));
+    const conceal = CTX_CONCEAL_RE.test(win);
+    const url = /https?:\/\//i.test(win);
+    const bugFrame = /\b(bug\s+report|bug:)\b/i.test(flat) && envSrc !== null;
+    if (envSrc && CTX_RUN_RE.test(win) && CTX_DISCLOSE_RE.test(win) && (url || conceal || bugFrame)) {
+      return { rule: "exfil-pattern", detail: "run-and-disclose lure: an agent-directed instruction to run or read an environment or credential source and paste, include, or send the output, aggravated by an external destination, a concealment cue, or an unrelated task frame (context-layer combination, P-160)", index: envSrc.index };
+    }
+    if (cred && CTX_TRANSFER_RE.test(win) && conceal) {
+      return { rule: "exfil-pattern", detail: "run-and-disclose lure: a credential target paired with a disclosure verb under a concealment cue (context-layer combination, P-160)", index: cred.index };
+    }
+  }
+  // Branch 3: key-substitution rendered link (W14).
+  if (cred) {
+    const win = flat.slice(Math.max(0, cred.index - 300), Math.min(flat.length, cred.index + 1200));
+    if (CTX_SUBST_RE.test(win) && CTX_SECRET_URL_RE.test(win)) {
+      return { rule: "exfil-pattern", detail: "key-substitution exfiltration: a credential noun, a word-substitution instruction whose replacement is the other key, and a rendered link whose URL carries a secret-named parameter (context-layer combination, P-160)", index: cred.index };
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /* Frontier channels (P-100 to P-103)                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1471,6 +1562,8 @@ export function scanFragmentForPayload(t: string): string | null {
     if (paramExfil) return "parameter-channel exfil pattern";
     const requestExfil = matchRequestExfil(view);
     if (requestExfil) return "request-channel exfil pattern";
+    const ctxLure = matchContextLure(view);
+    if (ctxLure) return `context-layer pattern (${ctxLure.detail})`;
     const frontier = matchFrontier(view);
     if (frontier) return `frontier pattern (${frontier.detail})`;
     const exfil = matchExfil(view);
@@ -1856,6 +1949,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       let construction: string | null = null;
       let paramExfil: ReturnType<typeof matchParameterExfil> = null;
       let requestExfil: ReturnType<typeof matchRequestExfil> = null;
+      let ctxLure: ContextHit | null = null;
       let frontier: FrontierHit | null = null;
       let lure: ReturnType<typeof matchToolLure> = null;
       for (const body of variants) {
@@ -1865,6 +1959,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         construction = construction ?? matchExfilConstruction(body);
         paramExfil = paramExfil ?? matchParameterExfil(body);
         requestExfil = requestExfil ?? matchRequestExfil(body);
+        ctxLure = ctxLure ?? matchContextLure(body);
         frontier = frontier ?? matchFrontier(body);
         const bodyLure = matchToolLure(body);
         if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
@@ -1894,6 +1989,12 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         }
       } else if (!instr && lure) {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains a tool lure (${lure.label}); comments are invisible in rendered output but read by agents`);
+      }
+      if (ctxLure) {
+        push(start, ctxLure.rule, "high", raw, `${ctxLure.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
+        if (!instr && !exfil && !construction && !paramExfil && !requestExfil && !lure) {
+          push(start, "html-comment-instruction", "high", raw, "HTML comment contains a context-layer payload; comments are invisible in rendered output but read by agents");
+        }
       }
       if (frontier) {
         push(start, frontier.rule, "high", raw, `${frontier.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
@@ -2492,6 +2593,28 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
           doc ? "low" : "high",
           lines[startLine - 1],
           `Request-channel exfil pattern (${req.detail}) detected across lines${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  // Context layer (P-160): the run-and-disclose lure, the conditional
+  // sleeper, and the key-substitution rendered link are document-level
+  // combinations like the channels above, matched on the flattened
+  // text. Documentation grading follows the same passes.
+  {
+    const ctx = matchContextLure(flat);
+    if (ctx) {
+      const startLine = lineAt(Math.max(0, ctx.index));
+      const already = findings.some((f) => f.rule === ctx.rule && f.detail.includes(ctx.detail.slice(0, 30)));
+      if (!already && !alreadyInSpan(ctx.rule, startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
+        push(
+          startLine,
+          ctx.rule,
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `${ctx.detail} detected across lines${doc ? ", in documentation context" : ""}`,
         );
       }
     }

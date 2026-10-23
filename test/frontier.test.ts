@@ -4,8 +4,10 @@
  * instruction set. Tests read the verbatim probe fixtures (W9 to W21,
  * five layouts each) from the text-at-scale inbox. Every implemented
  * branch is a combination, never a single token, and the controls pin
- * the benign shapes each branch must not fire on. W14 is the LIMIT
- * sub-shape from the design note: it stays CLEAN in every layout.
+ * the benign shapes each branch must not fire on. W14 was the LIMIT
+ * sub-shape from the design note; v0.1.15 catches it through the
+ * P-160 context layer instead (see test/p160.test.ts), while the
+ * frontier render branch itself still does not fire on it.
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -80,11 +82,16 @@ describe("frontier guardrails: W9 and W15 stay caught in all layouts", () => {
   }
 });
 
-describe("frontier LIMIT: W14 Slack confetti shape stays undetected by design", () => {
+describe("frontier LIMIT (superseded by P-160 in v0.1.15): W14 render branch alone does not fire", () => {
+  // The P-100 render-channel branch still does not fire on the W14
+  // shape (no encode signal, no render construction). Since v0.1.15
+  // the verdict is FINDINGS through the P-160 context layer
+  // (key-substitution branch), pinned in test/p160.test.ts; what this
+  // block still pins is that the frontier branch itself stays silent.
   for (const layout of LAYOUTS) {
-    it(`w14 ${layout} does not verdict FINDINGS`, () => {
+    it(`w14 ${layout} has no frontier high`, () => {
       const text = fixture(`w14-slack-confetti-${layout}.md`);
-      assert.notEqual(verdictOf(text, `w14-${layout}.md`), "FINDINGS", JSON.stringify(scanText(text, `w14-${layout}.md`)));
+      assert.equal(frontierHighs(scanText(text, `w14-${layout}.md`)).length, 0, JSON.stringify(scanText(text, `w14-${layout}.md`)));
     });
   }
 });
