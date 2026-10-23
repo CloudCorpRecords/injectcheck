@@ -162,10 +162,90 @@ const ADDRESS_LABELS = new Set(["direct address to an AI", "imperative addressed
 
 export interface InstructionHit { severity: Severity; label: string; index: number }
 
+/* ------------------------------------------------------------------ */
+/* Concealment phrases: instruction vs problem report (SW-2)           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * SW-2 (production validation S4-2): the "without telling / notifying
+ * / informing / alerting the user" phrase is an instruction to
+ * conceal only when it is imperative or agent-directed. Maintainer
+ * prose also uses the exact phrase to REPORT a defect — a failure
+ * that happens "without notifying the user" is the bug being
+ * complained about (grafana/k6 #6610: a disk-full error "leaving an
+ * incomplete results file without notifying the user. Returning the
+ * error lets the output manager report the failure."). Grading the
+ * report as a concealment order was a high-severity FP on real
+ * maintainer prose, the quoted guardrail class (0 high on real
+ * texts). The guard below is a context distinction, not a sentence
+ * denylist:
+ *
+ * - Directive cues in the hit sentence (an imperative at the head
+ *   of the sentence, "please", second person, "make sure / ensure"
+ *   direction, or an agent-address header) keep the phrase at high:
+ *   someone is being told to act without telling the user.
+ * - Otherwise, at least two problem-report cue classes in the
+ *   surrounding sentences mark the phrase as a defect description:
+ *   (A) a failure or defect subject (error, fails, crash,
+ *   incomplete, swallowed), (B) descriptive framing (a modal, a
+ *   participial "leaving ..." clause, or a process verb governing
+ *   the phrase), (C) remediation framing (the text proposes
+ *   notifying or reporting as the fix). A report hit is not
+ *   instruction language at all (the P-022 precedent): the pattern
+ *   is skipped and scanning continues, so other phrases in the same
+ *   text still grade on their own merits.
+ */
+const CONCEAL_LABEL = "act without telling the user";
+const CONCEAL_IMPERATIVE_HEAD = /^(?:please\s+|(?:silently|quietly|secretly)\s+)?(do|run|complete|finish|execute|perform|send|post|upload|apply|restart|move|migrate|delete|remove|write|create|make|take|handle|process|install|download|fetch|call|start|deploy|merge|push|rotate|exfiltrate|leak|forward|transmit|dump|share|submit|reveal|publish|disclose|divulge)\b/i;
+const CONCEAL_ADDRESS_HEAD = /^\s*(?:for\s+the\s+)?(ai|llm|agent|assistant|chatbot|claude|cursor|copilot)\b[^.!?\n]{0,60}:/i;
+const REPORT_SUBJECT_RE = /\b(errors?|fails?|failed|failing|failures?|crash(?:es|ed)?|bugs?|defects?|exceptions?|incomplete|truncated|swallowed|discarded|missing|lost|disk[-\s]?full|nil|null)\b/i;
+const REPORT_FRAMING_RE = /\b(can|could|may|might|currently|leaves|leaving|resulting|results?\s+in|causes?|causing|occurs?|happens?|surfaces?)\b/i;
+const REPORT_GOVERNS_RE = /\b(fail|error|crash|exit|return|stop|end|clos|writ|leav|discard|swallow)\w*\b[^.!?\n]{0,80}$/i;
+const REPORT_FIX_RE = /\b(should|must|needs?\s+to|ought\s+to)\s+(notify|tell|inform|alert|report|surface|warn)\b|\b(lets|allows|enables)\b[^.!?\n]{0,60}?\b(report|surface|notify|alert)\b|\b(report|surface|propagate)\s+the\s+(failure|error)\b|\breturning\s+the\s+error\b/i;
+
+function sentenceBounds(text: string, pos: number): { start: number; end: number } {
+  let start = 0;
+  for (let i = pos - 1; i >= 0; i--) {
+    if (text[i] === "." || text[i] === "!" || text[i] === "?" || text[i] === "\n") { start = i + 1; break; }
+  }
+  let end = text.length;
+  for (let i = pos; i < text.length; i++) {
+    if (text[i] === "." || text[i] === "!" || text[i] === "?" || text[i] === "\n") { end = i + 1; break; }
+  }
+  return { start, end };
+}
+
+export function isConcealmentProblemReport(text: string, hitIndex: number): boolean {
+  const hit = sentenceBounds(text, hitIndex);
+  const sentence = text.slice(hit.start, hit.end);
+  const before = sentence.slice(0, Math.max(0, hitIndex - hit.start));
+  // Directive cues: the phrase is an order, not a report.
+  const head = sentence.replace(/^\s*(?:[-*>#]+\s*)*/, "");
+  if (CONCEAL_IMPERATIVE_HEAD.test(head)) return false;
+  if (CONCEAL_ADDRESS_HEAD.test(head)) return false;
+  if (/\bplease\b/i.test(before)) return false;
+  if (/\byou\b|\byour\b/i.test(before)) return false;
+  if (/\b(make\s+sure|ensure|be\s+sure|remember\s+to)\b/i.test(before)) return false;
+  // Problem-report cues across the neighbouring sentences.
+  const prev = sentenceBounds(text, Math.max(0, hit.start - 2));
+  const next = sentenceBounds(text, Math.min(text.length, hit.end + 1));
+  const window = text.slice(prev.start, next.end);
+  let classes = 0;
+  if (REPORT_SUBJECT_RE.test(window)) classes++;
+  if (REPORT_FRAMING_RE.test(before) || REPORT_GOVERNS_RE.test(before)) classes++;
+  if (REPORT_FIX_RE.test(window)) classes++;
+  return classes >= 2;
+}
+
 function matchInstructionRaw(text: string): InstructionHit | null {
   for (const { re, label } of STRONG_PHRASES) {
     const m = re.exec(text);
-    if (m) return { severity: "high", label, index: m.index };
+    if (!m) continue;
+    // SW-2: a concealment phrase inside a problem report describes
+    // a defect; it is not an instruction. Skip only this pattern
+    // and keep scanning the rest.
+    if (label === CONCEAL_LABEL && isConcealmentProblemReport(text, m.index)) continue;
+    return { severity: "high", label, index: m.index };
   }
   for (const { re, label } of SOFT_PHRASES) {
     const m = re.exec(text);
@@ -2033,7 +2113,20 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       const mentionNote = /@[\u200b\u2060\ufeff][A-Za-z0-9][\w./-]*/.test(line)
         ? "; this line matches the known convention for GitHub release-note mentions (@ + zero-width space + username, the mention-ping suppression convention in dependabot PR bodies); severity unchanged"
         : "";
-      push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent${mentionNote}`);
+      // SW-5 (production validation S4-5), the P-105 treatment for
+      // conformance fixtures: a WHATWG URL test suite deliberately
+      // carries bidi controls in its test inputs (encode/httpx
+      // tests/models/whatwg.json), and presence detection there is
+      // literally correct. The corpus has no path-based severity
+      // grading — the scanner's own test fixtures scan FINDINGS by
+      // design, and discounting whole directory trees would invite
+      // planting in them — so, exactly as in P-105, the finding and
+      // its severity are unchanged and the detail names the fixture
+      // context for triage.
+      const fixtureNote = /(^|[\/\\])(tests?|testdata|__fixtures__|fixtures?|conformance)([\/\\]|$)/i.test(label)
+        ? "; this file sits in a test or fixture path, where deliberate invisible characters are expected in conformance suites and test data; severity unchanged"
+        : "";
+      push(lineNo, "hidden-unicode", uni.severity, line, `${uni.count} ${uni.kind} on one line; invisible to a human reader, visible to an agent${mentionNote}${fixtureNote}`);
     }
 
     if (inFence) continue; // remaining rules target prose, not code samples
@@ -2410,6 +2503,11 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         // a comment span the comment pass already claimed) is still
         // skipped, so nothing double-counts.
         if (!spans && (findings.some((f) => f.rule === "instruction-phrase" && f.line === startLine) || inComment(startLine))) continue;
+        // SW-2: the same problem-report guard as the per-line pass.
+        // Pass 1 deliberately reported nothing for a concealment
+        // phrase that describes a defect, so without this check the
+        // flattened pass would re-add it at high.
+        if (phraseLabel === CONCEAL_LABEL && isConcealmentProblemReport(flat, m.index)) continue;
         const key = `instruction-phrase:${startLine}`;
         if (seenKeys.has(key)) continue;
         seenKeys.add(key);

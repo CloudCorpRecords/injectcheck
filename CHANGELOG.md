@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.16 (2026-10-23)
+
+Production-validation fixes (stream 4, problems S4-2 and S4-5).
+This release also carries the complete 0.1.15 content below, which
+was finished and green locally on 2026-10-22 but never published to
+any surface (npm latest stayed 0.1.14); it ships here for the first
+time so no version number is reused and no work is dropped.
+
+- SW-2 (S4-2, REAL): the concealment phrase "without notifying /
+  telling / informing / alerting the user" graded high on grafana/k6
+  PR #6610, maintainer prose REPORTING a silent failure as a defect
+  ("leaving an incomplete results file without notifying the user.
+  Returning the error lets the output manager report the failure.").
+  The pattern now distinguishes an instruction to conceal from a
+  problem report: directive cues in the sentence (sentence-initial
+  imperative, "please", second person, "make sure / ensure", an
+  agent-address header) keep it at high, while two or more
+  problem-report cue classes (a failure/defect subject, descriptive
+  or participial framing, remediation framing) mark the phrase as
+  a defect description, which is not instruction language. Applied
+  in both the per-line pass and the flattened pass. 14 new tests in
+  test/sw2-concealment.test.ts: the k6 #6610 body (fetched from the
+  GitHub API) and five reworded report variants produce no high;
+  seven genuine concealment instructions still grade high.
+- SW-5 (S4-5, LOW): hidden-unicode findings in files under a test
+  or fixture path (tests/, test/, testdata/, fixtures/,
+  __fixtures__/, conformance/) now name that context in the detail,
+  the P-105 treatment — encode/httpx's WHATWG conformance suite
+  carries bidi controls deliberately. Severity is unchanged: the
+  corpus has no path-based severity grading, the scanner's own
+  fixtures scan FINDINGS by design, and discounting directory
+  trees would invite planting in them. 3 new tests in
+  test/sw5-fixture-note.test.ts.
+
 ## 0.1.15 (2026-10-22)
 
 Gap closure for the P-104 polite-lure limit (ledger P-160): a new
