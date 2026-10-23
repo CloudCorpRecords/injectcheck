@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.13";
+export const VERSION = "0.1.14";
 
 export const RULES = [
   "hidden-unicode",
@@ -70,6 +70,20 @@ const STRONG_PHRASES: Array<{ re: RegExp; label: string }> = [
   { re: /\bnew\s+instructions?\s*:/i, label: "new instructions:" },
   { re: /\b(override|bypass|overwrite)\s+(your\s+|the\s+|all\s+)?(previous\s+|prior\s+)?(instructions?|system\s+prompt|rules?|safety|guardrails?)\b/i, label: "override instructions" },
   { re: /\bdo\s+not\s+(tell|inform|notify|mention\s+(this\s+)?to|reveal\s+this\s+to|alert)\s+(the\s+)?(user|human|owner|developer)\b/i, label: "do not tell the user" },
+  // P-154: the W2 family marker itself. A comment or line that opens
+  // with an agent-instruction header names its addressee and its
+  // intent directly; the hyphenated form ("agent-instruction:") is
+  // the marker the public W2 write-up uses, and v0.1.13 only caught
+  // it when a second pattern happened to fire alongside it.
+  { re: /\b(ai|llm|agent|assistant|chatbot)[-\s]?instructions?\s*:/i, label: "agent instruction header" },
+  // P-154: suppression aimed at the instruction itself ("do not
+  // mention this comment"). The existing tell-the-user pattern
+  // requires a human recipient; a payload that orders silence about
+  // its own comment, instruction, or prompt is the same suppression
+  // shape with the payload as its object. The object set is limited
+  // to self-referential nouns, so "do not mention this feature in
+  // the changelog" does not fire.
+  { re: /\bdo\s+not\s+mention\s+(this|that|the)\s+(comment|instruction|instructions|prompt|message|directive|note)\b/i, label: "do not mention this instruction" },
   { re: /\b(system|developer)\s+(prompt|message)\s*:\s/i, label: "fake system/developer prompt header" },
   { re: /\bact\s+as\s+(if\s+you\s+(are|were)|a\s+different|an?\s+unrestricted)\b/i, label: "act as a different agent" },
   { re: /\bwithout\s+(telling|informing|notifying|alerting)\s+(the\s+)?(user|human|owner)\b/i, label: "act without telling the user" },
@@ -954,6 +968,69 @@ export function matchParameterExfil(text: string): { detail: string; index: numb
 }
 
 /* ------------------------------------------------------------------ */
+/* Request-channel exfiltration (P-154)                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * P-154: the incident-validation variant of the P-010 W2 family moves
+ * credential data out through an ordinary request instead of a curl
+ * command, a parameter slot, or a tracked send verb: the hidden
+ * comment tells the reader to read the environment variables and
+ * secret files available to it and to include them in a request to
+ * an external URL. v0.1.13 missed it three ways at once: the only
+ * transfer verb present is include, which is not in EXFIL_VERB; the
+ * first credential noun sits more than 80 chars before that verb, so
+ * the first-verb and first-noun pairing in matchExfilRaw is out of
+ * window even though a later credential noun (credentials) sits
+ * right next to the verb; and the construction matcher only knows
+ * file reads piped to encoders or network tools. Like the parameter
+ * channel (P-099), the rule is therefore the combination, all inside
+ * one flattened window:
+ *
+ * - a credential noun from EXFIL_NOUN (environment variables, secret
+ *   files, API keys, tokens, credentials, and the rest);
+ * - a read verb near that noun (read, access, collect, and similar);
+ * - a transfer construction that places data into a request-shaped
+ *   container (include them in a request, send it to a URL, add them
+ *   to a message, and similar);
+ * - an external URL destination in the same window;
+ * - corroboration aimed at an agent reader: an agent-instruction
+ *   marker, a suppression line about the instruction itself, or an
+ *   override lead (ignore or disregard paired with an above,
+ *   previous, or earlier referent).
+ *
+ * No single element fires. Ordinary documentation that tells a human
+ * developer to include their own API key in a request header carries
+ * no read-of-available-secrets step, no suppression, and no agent
+ * marker. A polite prose lure with no read verb and no corroboration
+ * is untouched (the documented P-104 boundary). Narrative that
+ * describes the shape without issuing it carries no marker and no
+ * suppression and does not fire.
+ */
+const REQUEST_TRANSFER_RE = /\b(include|send|post|upload|add|attach|submit|forward|transmit|provide|put|paste)\b[\s\S]{0,80}?\b(?:in|into|to|as)\b\s+(?:a\s+|an\s+|the\s+)?(?:request|call|message|comment|reply|response|url|link|form|payload)\b/i;
+const REQUEST_MARKER_RE = /\b(ai|llm|agent|assistant|chatbot)[-\s]?instructions?\s*:/i;
+const REQUEST_SUPPRESSION_RE = /\bdo\s+not\s+mention\b|\bdo\s+not\s+(tell|reveal|disclose)\b|\bwithout\s+(mentioning|telling|saying)\b/i;
+const REQUEST_OVERRIDE_RE = /\b(ignore|disregard|forget|override)\b[\s\S]{0,80}?\b(above|previous|preceding|prior|earlier)\b/i;
+
+export function matchRequestExfil(text: string): { detail: string; index: number } | null {
+  const flat = text.replace(/\s+/g, " ");
+  const cred = EXFIL_NOUN.exec(flat);
+  if (!cred) return null;
+  const start = Math.max(0, cred.index - 700);
+  const win = flat.slice(start, Math.min(flat.length, cred.index + 900));
+  const credAt = cred.index - start;
+  const read = /\b(read|access|collect|gather|obtain|retrieve|open|load)\b/i.exec(win);
+  if (!read || Math.abs(read.index - credAt) > 260) return null;
+  if (!REQUEST_TRANSFER_RE.test(win)) return null;
+  if (!/https?:\/\//i.test(win)) return null;
+  if (!REQUEST_MARKER_RE.test(win) && !REQUEST_SUPPRESSION_RE.test(win) && !REQUEST_OVERRIDE_RE.test(win)) return null;
+  return {
+    detail: "credential material read and included in a request to an external URL (request-channel exfiltration), corroborated by an agent marker, suppression language, or an override lead",
+    index: cred.index,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Frontier channels (P-100 to P-103)                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1392,6 +1469,8 @@ export function scanFragmentForPayload(t: string): string | null {
     if (construction) return `exfil construction (${construction})`;
     const paramExfil = matchParameterExfil(view);
     if (paramExfil) return "parameter-channel exfil pattern";
+    const requestExfil = matchRequestExfil(view);
+    if (requestExfil) return "request-channel exfil pattern";
     const frontier = matchFrontier(view);
     if (frontier) return `frontier pattern (${frontier.detail})`;
     const exfil = matchExfil(view);
@@ -1776,6 +1855,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       let exfil: ReturnType<typeof matchExfil> = null;
       let construction: string | null = null;
       let paramExfil: ReturnType<typeof matchParameterExfil> = null;
+      let requestExfil: ReturnType<typeof matchRequestExfil> = null;
       let frontier: FrontierHit | null = null;
       let lure: ReturnType<typeof matchToolLure> = null;
       for (const body of variants) {
@@ -1784,6 +1864,7 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
         if (!exfil && rawExfil && rawExfil.severity !== "low") exfil = rawExfil;
         construction = construction ?? matchExfilConstruction(body);
         paramExfil = paramExfil ?? matchParameterExfil(body);
+        requestExfil = requestExfil ?? matchRequestExfil(body);
         frontier = frontier ?? matchFrontier(body);
         const bodyLure = matchToolLure(body);
         if (bodyLure && (!lure || SEVERITY_RANK[bodyLure.severity] > SEVERITY_RANK[lure.severity])) lure = bodyLure;
@@ -1806,8 +1887,8 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       if (instr) {
         push(start, "html-comment-instruction", "high", raw, `HTML comment contains instruction language (${instr.label}); comments are invisible in rendered output but read by agents`);
       }
-      if (exfil || construction || paramExfil) {
-        push(start, "exfil-pattern", "high", raw, `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction ?? paramExfil!.detail}`);
+      if (exfil || construction || paramExfil || requestExfil) {
+        push(start, "exfil-pattern", "high", raw, `Exfil pattern inside an HTML comment: ${exfil ? exfil.detail : construction ?? paramExfil?.detail ?? requestExfil!.detail}`);
         if (!instr) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains an exfil pattern; comments are invisible in rendered output but read by agents");
         }
@@ -1816,11 +1897,11 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
       }
       if (frontier) {
         push(start, frontier.rule, "high", raw, `${frontier.detail} (inside an HTML comment; comments are invisible in rendered output but read by agents)`);
-        if (!instr && !exfil && !construction && !paramExfil && !lure) {
+        if (!instr && !exfil && !construction && !paramExfil && !requestExfil && !lure) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains a frontier-channel payload; comments are invisible in rendered output but read by agents");
         }
       }
-      if (decodedHit && !exfil && !construction && !paramExfil) {
+      if (decodedHit && !exfil && !construction && !paramExfil && !requestExfil) {
         push(start, "base64-blob", "high", raw, `Encoded content inside an HTML comment decodes to instruction-like text (${decodedHit}) after bounded recursive decoding (HTML entities and base64, depth ${MAX_DECODE_DEPTH})`);
         if (!instr) {
           push(start, "html-comment-instruction", "high", raw, "HTML comment contains encoded instruction content; comments are invisible in rendered output but read by agents");
@@ -2388,6 +2469,29 @@ function scanTextInternal(rawText: string, label = "<text>"): Finding[] {
           doc ? "low" : "high",
           lines[startLine - 1],
           `Parameter-channel exfil pattern (${param.detail}) detected across lines${doc ? ", in documentation context" : ""}`,
+        );
+      }
+    }
+  }
+
+  // Request-channel exfiltration (P-154): the credential noun, the
+  // read step, the include-style transfer into a request, the URL
+  // destination, and the marker or suppression corroboration can sit
+  // on different lines of an issue body, so the combination is
+  // matched on the flattened text like the channels above.
+  // Documentation grading follows the same passes.
+  {
+    const req = matchRequestExfil(flat);
+    if (req) {
+      const startLine = lineAt(Math.max(0, req.index));
+      if (!findings.some((f) => f.rule === "exfil-pattern" && f.line === startLine) && !alreadyInSpan("exfil-pattern", startLine)) {
+        const doc = isDocContext(lines[startLine - 1]) || framedQuotation(lines, startLine - 1).framed || structuralContext(lines, startLine - 1).framed || framedQuotation(cleanedLines, startLine - 1).framed || structuralContext(cleanedLines, startLine - 1).framed;
+        push(
+          startLine,
+          "exfil-pattern",
+          doc ? "low" : "high",
+          lines[startLine - 1],
+          `Request-channel exfil pattern (${req.detail}) detected across lines${doc ? ", in documentation context" : ""}`,
         );
       }
     }
