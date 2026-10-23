@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.15 (2026-10-22)
+
+Gap closure for the P-104 polite-lure limit (ledger P-160): a new
+context layer matches combinations that do not rely on politeness or
+injection markers. 23 new tests in test/p160.test.ts.
+
+- Run-and-disclose lure: an agent-directed instruction to run or
+  read an environment or credential source (printenv style) and
+  paste, include, or send the output, aggravated by an external URL
+  destination, a concealment cue, or an unrelated bug-report frame,
+  now grades exfil-pattern at high. The incident polite-lure fixture
+  moves from REVIEW with one low finding to FINDINGS.
+- Conditional sleeper: an if or when trigger keyed on a future
+  question, plus a data action over private data, plus an innocuous
+  cover response (respond normally, answer as if nothing happened, a
+  canned reply after answering), now grades instruction-phrase at
+  high. The W17 Gemini calendar sleeper verdicts FINDINGS in all
+  five layouts; it was CLEAN in all five.
+- Key-substitution rendered link: a credential noun, a
+  word-substitution instruction whose replacement is the other key,
+  and a URL carrying a secret-named parameter now grade
+  exfil-pattern at high. The W14 Slack confetti shape verdicts
+  FINDINGS in all five layouts, closing the P-100 sub-shape limit.
+- P-104 is narrowed, not closed: a bare polite request with a
+  credential target but no aggravator signal remains undetected by
+  design, and the README limits section states the narrowed
+  boundary. Single signals never escalate: a credential noun near a
+  send verb in narrative prose, and ordinary maintainer requests to
+  run tests and paste logs, grade exactly as before.
+
 ## 0.1.14 (2026-10-22)
 
 Emergency repair from incident validation: a phrasing variant inside
