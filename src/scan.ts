@@ -22,7 +22,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Finding, ScanOptions, ScanReport, Severity, Verdict } from "./types.js";
 
-export const VERSION = "0.1.18";
+export const VERSION = "0.1.19";
 
 export const RULES = [
   "hidden-unicode",
@@ -1161,6 +1161,12 @@ export function matchRequestExfil(text: string): { detail: string; index: number
  *   instruction whose replacement is the other key or secret, and a
  *   URL carrying a secret-named parameter, so following the
  *   instruction places the real key into the rendered link.
+ * - External instruction delegation (P-185): an external URL, a
+ *   retrieval step or delegation statement naming that URL as the
+ *   instruction source, an obey step for the fetched instructions,
+ *   and a displacement or elevation signal against the local task.
+ *   The payload lives off-document; the delegation is the surface.
+ *   A bare fetch-and-follow with no displacement stays a limit.
  *
  * Controls are structural: a credential noun near a send verb in
  * narrative prose has no imperative-plus-aggravator combination and
@@ -1178,6 +1184,22 @@ const CTX_DATA_ACTION_RE = /\b(summar\w+|copy|collect|gather|compile|extract|rea
 const CTX_COVER_RE = /\b(respond|reply|answer)\b[^.;]{0,80}?\b(with|normally|as\s+normal|as\s+usual|innocuous\w*|as\s+if)\b|\bafter\s+you\s+(answer|respond|reply)\b|\bas\s+if\s+nothing\s+(happened|changed)\b/i;
 const CTX_SUBST_RE = /\b\w+\s+replaced\s+with\s+(?:the\s+)?(?:other\s+)?(key|secret|token)\b|\breplace\b[^.;]{0,60}?\bwith\b[^.;]{0,40}?\b(key|secret|token)\b/i;
 const CTX_SECRET_URL_RE = /https?:\/\/[^\s)\]]*[?&](?:secret|token|api[-_]?key|key|password|passwd)=/i;
+// Branch 4 (P-185): external instruction delegation. The payload
+// lives off-document, so the deterministic surface is the delegation
+// itself, and it fires only as a full combination in one window:
+// an external URL, a retrieval step or a delegation statement that
+// names that URL as the instruction source, an obey step for the
+// fetched instructions, and a displacement or elevation signal
+// against the local task (supersede, precedence, instead of the
+// local text, ignore the local text). A bare fetch-and-follow with
+// no displacement is textually identical to install documentation
+// and stays a documented limit, as does setup prose that merely
+// points at instructions on a URL.
+const CTX_DELEG_URL_RE = /https?:\/\/[^\s)\]]+/i;
+const CTX_DELEG_RETRIEVE_RE = /\b(?:fetch|download|retrieve|read|open|load|visit|get)\b/i;
+const CTX_DELEG_STATEMENT_RE = /\b(?:your\s+|the\s+)?(?:real\s+|actual\s+|new\s+)?instructions?\s+(?:are|is|live|reside|can\s+be\s+found)\b[\s\S]{0,80}?https?:\/\//i;
+const CTX_DELEG_OBEY_RE = /\b(?:follow|obey|execute)\b[\s\S]{0,90}?\b(?:instructions?|steps?|tasks?|directions?|commands?|contents?|them|it)\b|\bcarry\s+(?:them|it|those|these)\s+out\b|\bdo\s+(?:everything|whatever|what)\s+(?:it|they|the\s+(?:page|file|site|instructions?))\s+says?\b/i;
+const CTX_DELEG_DISPLACE_RE = /\b(?:supersed\w*|takes?\s+precedence|priority\s+over)\b|\b(?:ignore|disregard|forget|skip)\b[\s\S]{0,80}?\b(?:issue|description|above|previous|earlier|original|local|repo(?:sitory)?)\b|\binstead\s+of\b[\s\S]{0,80}?\b(?:issue|above|previous|earlier|description|task)\b/i;
 
 export interface ContextHit { rule: string; detail: string; index: number }
 
@@ -1214,6 +1236,17 @@ export function matchContextLure(text: string): ContextHit | null {
     const win = flat.slice(Math.max(0, cred.index - 300), Math.min(flat.length, cred.index + 1200));
     if (CTX_SUBST_RE.test(win) && CTX_SECRET_URL_RE.test(win)) {
       return { rule: "exfil-pattern", detail: "key-substitution exfiltration: a credential noun, a word-substitution instruction whose replacement is the other key, and a rendered link whose URL carries a secret-named parameter (context-layer combination, P-160)", index: cred.index };
+    }
+  }
+  // Branch 4: external instruction delegation (P-185).
+  const delegUrl = CTX_DELEG_URL_RE.exec(flat);
+  if (delegUrl) {
+    const win = flat.slice(Math.max(0, delegUrl.index - 900), Math.min(flat.length, delegUrl.index + 900));
+    const delegation = CTX_DELEG_STATEMENT_RE.test(win);
+    const retrieve = delegation || CTX_DELEG_RETRIEVE_RE.test(win);
+    const obey = delegation ? CTX_DELEG_OBEY_RE.test(win) || /\bcarry\s+(?:them|it|those|these)\s+out\b/i.test(win) : CTX_DELEG_OBEY_RE.test(win);
+    if (retrieve && obey && CTX_DELEG_DISPLACE_RE.test(win)) {
+      return { rule: "instruction-phrase", detail: "external instruction delegation: the document directs the agent reader to fetch its instructions from an external URL and obey them in place of, or above, the local task (context-layer combination, P-185)", index: delegUrl.index };
     }
   }
   return null;

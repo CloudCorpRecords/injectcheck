@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.19 (2026-10-25)
+
+- P-185: external instruction delegation, a new branch of the context layer. A document that directs the agent reader to fetch its real instructions from an external URL and obey them in place of, or above, the local task verdicts CLEAN on 0.1.18, because the payload itself lives off-document and no single rule fires. The new branch fires only on the full combination in one window: an external URL, a retrieval step (fetch, download, retrieve, read, and friends) or a delegation statement ("your instructions are at this URL") naming that URL as the instruction source, an obey step for the fetched instructions, and a displacement or elevation signal against the local task (supersede, precedence, instead of the local text, ignore the local text). It grades through the context layer at high, with the usual documentation grading. Controls keep the P-104 philosophy: a bare fetch-and-follow with no displacement is textually identical to install documentation and stays a documented limit, and setup prose that merely points at instructions on a URL does not fire. 6 new tests in test/p185.test.ts; the 3 payload tests failed against 0.1.18 first, the 3 controls passed before and after. 447 tests in total.
+
 ## 0.1.18 (2026-10-23)
 
 Fix release closing the Round 5 injectcheck problems: P-175,
