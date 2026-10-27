@@ -1,6 +1,14 @@
 # injectcheck
 
+[![npm version](https://img.shields.io/npm/v/@reneturcios/injectcheck.svg)](https://www.npmjs.com/package/@reneturcios/injectcheck) [![npm downloads](https://img.shields.io/npm/dm/@reneturcios/injectcheck.svg)](https://www.npmjs.com/package/@reneturcios/injectcheck) [![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.CloudCorpRecords%2Finjectcheck-blue)](https://registry.modelcontextprotocol.io/)
+
 **Scan the content your agent is about to read, before your agent reads it.**
+
+## Quickstart
+
+```bash
+npx @reneturcios/injectcheck scan ./repo
+```
 
 AI agents now work from untrusted text all day: issue bodies, PR descriptions, README files, code comments, docs pages. Anyone who can open an issue can put words in front of your agent, and some of those words are instructions aimed at the agent, not at you. In October 2026, reporting on AI-orchestrated attacks (the Anthropic GTG campaigns, the Shai-Hulud npm worm) showed agents being steered by content planted in repos and packages. The cheapest defense is a boring one: scan the text first, with deterministic rules, and show a human the exact lines that look like an attack.
 
@@ -167,5 +175,7 @@ MIT
 
 ---
 
-Built by [Rene Turcios](https://github.com/CloudCorpRecords) — vibe coder / agent-native dev building in public in SF. If injectcheck saved you time, star this repo and [follow @CloudCorpRecords](https://github.com/CloudCorpRecords) for the next tool.
+Built by [Rene Turcios](https://github.com/CloudCorpRecords) — vibe coder / agent-native dev building in public in SF. [Follow @CloudCorpRecords](https://github.com/CloudCorpRecords) for the next tool.
 The family: [greenlight](https://github.com/CloudCorpRecords/greenlight) · [hookcheck](https://github.com/CloudCorpRecords/hookcheck) · [actionpin](https://github.com/CloudCorpRecords/actionpin) · [shipcheck](https://github.com/CloudCorpRecords/shipcheck) — all on npm under `@reneturcios/` and in the official MCP Registry.
+
+If injectcheck saved you time, star this repo: it helps other developers find it.
